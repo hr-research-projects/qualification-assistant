@@ -1,3 +1,81 @@
+def render_future_profile_section(profile, ist_details, udemy_courses_df, skill_lookup):
+    """Zeigt Ranking und Kursempfehlungen für ein zukünftiges SOLL-Profil"""
+    profile_name = profile.get('name', 'SOLL-Profil')
+    required_skills = profile.get('skills', [])
+    normalized_map = {
+        normalize_skill_name(skill): skill
+        for skill in required_skills if skill
+    }
+    
+    if not normalized_map:
+        st.info(f"Für {profile_name} wurden keine Fähigkeiten gefunden.")
+        return
+    
+    required_norm_set = set(normalized_map.keys())
+    total_required = len(required_norm_set)
+    
+    ranking = []
+    for detail in ist_details:
+        norm_set = detail.get('normalized_skills_set', set())
+        matched_norm = required_norm_set & norm_set
+        missing_norm = required_norm_set - norm_set
+        ranking.append({
+            'ist_name': detail['name'],
+            'match_count': len(matched_norm),
+            'missing_count': len(missing_norm),
+            'match_percent': round(len(matched_norm) / total_required * 100, 1) if total_required else 0,
+            'matched_skills': sorted(normalized_map[n] for n in matched_norm),
+            'missing_skills': sorted(normalized_map[n] for n in missing_norm)
+        })
+    
+    ranking.sort(key=lambda x: (-x['match_count'], x['missing_count'], x['ist_name']))
+    top_results = ranking[:5]
+    
+    st.markdown(f"### {profile_name} – {total_required} Skills")
+    render_skill_list(required_skills)
+    st.markdown("---")
+    
+    selected_course_request = None
+    
+    for idx, result in enumerate(top_results):
+        title = f"Platz {idx + 1}: {result['ist_name']} ({result['match_count']}/{total_required} Treffer, {result['match_percent']}%)"
+        with st.expander(title, expanded=False):
+            col_a, col_b = st.columns(2)
+            with col_a:
+                st.write("**Gemeinsame Fähigkeiten:**")
+                if result['matched_skills']:
+                    for skill in result['matched_skills']:
+                        st.write(f"  ✓ {skill}")
+                else:
+                    st.info("Keine Übereinstimmungen gefunden.")
+            with col_b:
+                st.write("**Fehlende Fähigkeiten:**")
+                if result['missing_skills']:
+                    for skill in result['missing_skills']:
+                        st.write(f"  ✗ {skill}")
+                else:
+                    st.success("Alle benötigten Fähigkeiten vorhanden!")
+            
+            if result['missing_skills']:
+                button_key = f"courses_{profile_name}_{idx}_{result['ist_name']}"
+                if st.button(f"▤ Kursempfehlungen für {result['ist_name']}", key=button_key):
+                    selected_course_request = {
+                        'ist_name': result['ist_name'],
+                        'missing_skills': result['missing_skills']
+                    }
+    st.markdown("---")
+    
+    if selected_course_request:
+        st.markdown(
+            f"#### Kursempfehlungen für {selected_course_request['ist_name']} "
+            f"(fehlende Skills: {len(selected_course_request['missing_skills'])})"
+        )
+        render_course_recommendations_for_profile(
+            selected_course_request['missing_skills'],
+            udemy_courses_df,
+            skill_lookup
+        )
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -11,6 +89,7 @@ import time
 import warnings
 import unicodedata
 from difflib import SequenceMatcher
+from collections import defaultdict
 import xml.etree.ElementTree as ET
 warnings.filterwarnings('ignore')
 
@@ -175,7 +254,7 @@ def expand_job_aliases(label):
         return []
     
     candidates = [label]
-    separators = ['\n', '|', '/', ';']
+    separators = ['\n', '|', ';']
     
     for sep in separators:
         next_candidates = []
@@ -227,6 +306,156 @@ def expand_job_aliases(label):
             unique.append(item)
     return unique
 
+def normalize_skill_name(skill_name):
+    """Normalisiert Skill-Bezeichnungen für robuste Vergleiche"""
+    if pd.isna(skill_name):
+        return ""
+    text = unicodedata.normalize('NFKC', str(skill_name)).lower().strip()
+    text = text.replace('–', '').replace('-', '')
+    text = text.replace('/', ' ')
+    replacements = {
+        'ä': 'ae',
+        'ö': 'oe',
+        'ü': 'ue',
+        'ß': 'ss'
+    }
+    for src, tgt in replacements.items():
+        text = text.replace(src, tgt)
+    text = re.sub(r'[^a-z0-9 ]+', ' ', text)
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+_FORCED_HYPHEN_PATTERN = re.compile(r'([A-Za-zÄÖÜäöüß])\-([a-zäöüß])')
+
+def clean_skill_label(label):
+    """Entfernt erzwungene Silbentrennungen und überflüssige Leerzeichen aus Skill-Bezeichnungen."""
+    if label is None:
+        return ""
+    text = str(label).replace('\u00ad', '').strip()
+    if not text:
+        return ""
+    previous = None
+    while previous != text:
+        previous = text
+        text = _FORCED_HYPHEN_PATTERN.sub(r'\1\2', text)
+    text = re.sub(r'\s+', ' ', text)
+    return text
+
+def is_valid_kldb_label(label):
+    """Filtert fehlerhafte KldB-Bezeichnungen wie 'in - ...' oder '-frau ...' heraus."""
+    if label is None:
+        return False
+    text = str(label).strip()
+    if len(text) < 4:
+        return False
+    lower = text.lower()
+    if lower.startswith('in -'):
+        return False
+    if not re.match(r'^[A-ZÄÖÜ]', text):
+        return False
+    return True
+
+def is_informative_kldb_label(label):
+    """Bewertet, ob eine KldB-Bezeichnung ausreichend beschreibend ist."""
+    if not is_valid_kldb_label(label):
+        return False
+    text = str(label)
+    if len(text) >= 12:
+        return True
+    if re.search(r'[\-()/]', text):
+        return True
+    if ' ' in text:
+        return True
+    return False
+
+def select_preferred_alias(alias_list):
+    """Wählt die aussagekräftigste Alias-Bezeichnung aus."""
+    if not alias_list:
+        return None
+    informative = [alias for alias in alias_list if is_informative_kldb_label(alias)]
+    candidates = informative if informative else alias_list
+    candidates = sorted(candidates, key=lambda a: (-len(a), a))
+    return candidates[0]
+
+def render_skill_list(skills, columns=3):
+    """Zeigt eine einfache Liste von Skills in mehreren Spalten"""
+    if not skills:
+        st.info("Keine Skills vorhanden.")
+        return
+    cols = st.columns(columns)
+    for idx, skill in enumerate(skills):
+        cols[idx % columns].write(f"• {skill}")
+
+@st.cache_data
+def build_skill_lookup(skills_df):
+    """Erstellt ein Mapping von normalisierten Skillnamen zu ihren URIs"""
+    lookup = {}
+    if skills_df is None or skills_df.empty:
+        return lookup
+    for _, row in skills_df.iterrows():
+        label = row.get('preferredLabel', '')
+        if pd.isna(label):
+            continue
+        lookup[normalize_skill_name(label)] = row.get('conceptUri', '')
+    return lookup
+
+def prepare_missing_skill_entries(skill_names, skill_lookup):
+    """Bereitet fehlende Skills für die Kursempfehlungsfunktion vor"""
+    entries = []
+    for skill in skill_names:
+        norm = normalize_skill_name(skill)
+        entries.append({
+            'skill_label': skill,
+            'skill_uri': skill_lookup.get(norm, ''),
+            'is_essential': False
+        })
+    return entries
+
+def render_course_recommendations_for_profile(skill_names, udemy_courses_df, skill_lookup):
+    """Zeigt Kursempfehlungen für eine Menge fehlender Skills"""
+    if not skill_names:
+        st.success("Alle benötigten Fähigkeiten sind bereits vorhanden – keine Kurse nötig.")
+        return
+    
+    skill_entries = prepare_missing_skill_entries(skill_names, skill_lookup)
+    with st.spinner("Suche passende Kurse für fehlende Fähigkeiten..."):
+        recommendations = find_udemy_courses_for_skills(skill_entries, udemy_courses_df, top_k=3)
+    
+    if not recommendations:
+        st.info("Keine passenden Kursempfehlungen gefunden.")
+        return
+    
+    grouped = {}
+    for rec in recommendations:
+        skill = rec.get('skill') or rec.get('skill_label') or 'Unbekannter Skill'
+        grouped.setdefault(skill, []).append(rec)
+    
+    st.markdown("**Empfohlene Kurse für fehlende Fähigkeiten:**")
+    for skill, recs in grouped.items():
+        expander_title = f"{skill} – {min(len(recs), 3)} Kurse"
+        with st.expander(expander_title, expanded=False):
+            for idx, rec in enumerate(recs[:3], 1):
+                title = rec.get('course_title', 'Unbekannter Kurs')
+                score = rec.get('similarity_score', 0)
+                url = rec.get('course_url', '')
+                headline = rec.get('course_headline', '')
+                matched_list = rec.get('matched_skills_list') or []
+                if not matched_list:
+                    matched_list = [skill]
+                num_matched = max(len(matched_list), rec.get('num_matched_skills', 0), 1)
+                coverage_preview = ', '.join(matched_list[:5])
+                if len(matched_list) > 5:
+                    coverage_preview += " ..."
+                
+                st.write(f"{idx}. {title} (Score: {score:.3f}) – deckt {num_matched} Skill(s) ab")
+                if headline:
+                    st.caption(headline)
+                st.write("**Abgedeckte Skills:**")
+                for covered_skill in matched_list:
+                    st.write(f"- {covered_skill}")
+                if url:
+                    st.markdown(f"[Zum Kurs]({url})")
+
 def _prepare_berufsbenennungen_df(df):
     """Bereitet das Alphabetische Verzeichnis zur schnellen Suche vor"""
     if df is None or df.empty:
@@ -244,7 +473,13 @@ def _prepare_berufsbenennungen_df(df):
     
     df = df[['Berufsbenennungen', 'KldB_Code']].dropna()
     df['Berufsbenennungen'] = df['Berufsbenennungen'].astype(str).str.strip()
-    df['KldB_Code'] = df['KldB_Code'].astype(str).str.strip()
+    df['KldB_Code'] = (
+        df['KldB_Code']
+        .astype(str)
+        .str.extract(r'(\d{5})')[0]
+    )
+    df = df.dropna(subset=['KldB_Code'])
+    df['KldB_Code'] = df['KldB_Code'].str.strip()
     df = df[(df['Berufsbenennungen'] != '') & (df['KldB_Code'] != '')]
     
     records = []
@@ -276,7 +511,15 @@ def load_berufsbenennungen_dataset(data_dir=DATA_DIR):
     
     if os.path.exists(excel_path):
         try:
-            df = pd.read_excel(excel_path)
+            df = pd.read_excel(
+                excel_path,
+                sheet_name='alphabet_Verz_Berufsb',
+                header=None,
+                skiprows=4,
+                names=['Berufsbenennungen', 'KldB 2010 (5-Steller)']
+            )
+            if not df.empty:
+                df = df.dropna(how='all')
             source = 'xlsx'
         except Exception as e:
             st.error(f"Fehler beim Laden der XLSX-Datei '{excel_path}': {str(e)}")
@@ -412,6 +655,64 @@ def get_unique_esco_roles(kldb_esco_df, kldb_code):
         return rows
     return rows.drop_duplicates(subset=['ESCO_Code', 'ESCO_Label'])
 
+def select_groupings_for_actor(grouping_ids, groupings, grouping_resources):
+    """Wählt bevorzugte Groupings (Fähigkeiten > Skills > Resources) für einen zukünftigen Actor"""
+    if not grouping_ids:
+        return []
+    
+    def has_keyword(gid, keyword):
+        name = groupings.get(gid, '').lower()
+        return keyword in name
+    
+    prioritized = [
+        lambda gid: has_keyword(gid, 'fähigkeit'),
+        lambda gid: has_keyword(gid, 'skill'),
+        lambda gid: has_keyword(gid, 'resource')
+    ]
+    
+    for predicate in prioritized:
+        selected = [gid for gid in grouping_ids if predicate(gid) and grouping_resources.get(gid)]
+        if selected:
+            return selected
+    
+    return [gid for gid in grouping_ids if grouping_resources.get(gid)]
+
+def extract_future_profiles(actors, associations, groupings, grouping_resources):
+    """Extrahiert zukünftige Mitarbeiterprofile (Mitarbeiter/in A-E) mit ihren Skills"""
+    future_profiles = []
+    actor_ids_by_name = defaultdict(list)
+    
+    for actor in actors:
+        actor_ids_by_name[actor['name']].append(actor['identifier'])
+    
+    for actor_name, ids in actor_ids_by_name.items():
+        if not re.match(r'^Mitarbeiter/in [A-E]$', actor_name):
+            continue
+        
+        related_groupings = set()
+        for assoc in associations:
+            if assoc['source'] in ids and assoc['target'] in groupings:
+                related_groupings.add(assoc['target'])
+        
+        selected_groupings = select_groupings_for_actor(list(related_groupings), groupings, grouping_resources)
+        skills = set()
+        for gid in selected_groupings:
+            for skill in grouping_resources.get(gid, []):
+                if skill:
+                    skills.add(skill)
+        
+        skills_list = sorted(skills, key=lambda s: s.lower())
+        future_profiles.append({
+            'name': actor_name,
+            'skills': skills_list,
+            'skill_count': len(skills_list)
+        })
+    
+    future_profiles.sort(key=lambda x: x['name'])
+    return future_profiles
+
+LOAD_DATA_CACHE_VERSION = "load_data_v8"
+
 def enhance_kldb_mapping(kldb_esco_df, berufsbenennungen_df):
     """Harmonisiert KldB-Bezeichnungen mit dem Alphabetischen Verzeichnis und ergänzt Synonyme"""
     if kldb_esco_df.empty:
@@ -419,6 +720,9 @@ def enhance_kldb_mapping(kldb_esco_df, berufsbenennungen_df):
     
     enhanced_df = kldb_esco_df.copy()
     enhanced_df['KldB_Label'] = enhanced_df['KldB_Label'].astype(str).str.strip()
+    enhanced_df['KldB_Code'] = enhanced_df['KldB_Code'].astype(str).str.strip()
+    enhanced_df['KldB_Code_5'] = enhanced_df['KldB_Code'].str.extract(r'(\d{5})')
+    enhanced_df = enhanced_df[enhanced_df['KldB_Label'].apply(is_valid_kldb_label)].copy()
     
     if berufsbenennungen_df is None or berufsbenennungen_df.empty:
         return enhanced_df, 0, 0
@@ -435,15 +739,21 @@ def enhance_kldb_mapping(kldb_esco_df, berufsbenennungen_df):
     alias_rows = []
     
     for code, alias_list in alias_map.items():
-        mask = enhanced_df['KldB_Code'] == code
+        code_str = str(code).strip()
+        if not code_str:
+            continue
+        code_5 = re.findall(r'\d{5}', code_str)
+        target_code = code_5[0] if code_5 else code_str[-5:]
+        mask = enhanced_df['KldB_Code_5'] == target_code
         if not mask.any():
             continue
         
         clean_aliases = []
         for alias in alias_list:
             alias_str = str(alias).strip()
-            if alias_str:
-                clean_aliases.append(alias_str)
+            if not is_valid_kldb_label(alias_str):
+                continue
+            clean_aliases.append(alias_str)
         
         if not clean_aliases:
             continue
@@ -458,7 +768,11 @@ def enhance_kldb_mapping(kldb_esco_df, berufsbenennungen_df):
                 chosen_label = alias
                 break
         if chosen_label is None:
-            chosen_label = min(clean_aliases, key=len)
+            chosen_label = select_preferred_alias(clean_aliases) or clean_aliases[0]
+        elif not is_informative_kldb_label(chosen_label):
+            better_alias = select_preferred_alias(clean_aliases)
+            if better_alias:
+                chosen_label = better_alias
         
         # Aktualisiere alle vorhandenen Zeilen für diesen Code
         enhanced_df.loc[mask, 'KldB_Label'] = chosen_label
@@ -469,6 +783,8 @@ def enhance_kldb_mapping(kldb_esco_df, berufsbenennungen_df):
         for alias in clean_aliases:
             if normalize_job_label(alias) == normalize_job_label(chosen_label):
                 continue
+            if not is_informative_kldb_label(alias):
+                continue
             alias_row = base_row.copy()
             alias_row['KldB_Label'] = alias
             alias_rows.append(alias_row)
@@ -477,10 +793,12 @@ def enhance_kldb_mapping(kldb_esco_df, berufsbenennungen_df):
         enhanced_df = pd.concat([enhanced_df, pd.DataFrame(alias_rows)], ignore_index=True)
     
     enhanced_df = enhanced_df.drop_duplicates(subset=['KldB_Code', 'KldB_Label', 'ESCO_Code'])
+    enhanced_df = enhanced_df[enhanced_df['KldB_Label'].apply(is_valid_kldb_label)]
+    enhanced_df = enhanced_df.drop(columns=['KldB_Code_5'], errors='ignore')
     return enhanced_df, replacements, len(alias_rows)
 
 @st.cache_data
-def load_data():
+def load_data(cache_buster=LOAD_DATA_CACHE_VERSION):
     """Lädt alle benötigten CSV-Dateien"""
     try:
         # KldB zu ESCO Mapping
@@ -503,7 +821,6 @@ def load_data():
             if alias_additions:
                 st.info(f"{alias_additions} zusätzliche KldB-Synonyme verfügbar gemacht.")
         else:
-            st.warning("Alphabetisches Verzeichnis der Berufsbenennungen nicht gefunden. Bitte stelle sicher, dass die XLSX- oder CSV-Datei im data-Ordner liegt.")
             label_updates = alias_additions = 0
         
         # ESCO Beruf-Skill Beziehungen (die richtige Datei!)
@@ -1928,8 +2245,10 @@ def parse_kompetenzabgleich_xml(xml_file_path):
                 'error': f"Original: {str(e)}, Fallback: {str(fallback_error)}"
             }
 
+FUTURE_PROFILE_CACHE_KEY = "future_profiles_v3"
+
 @st.cache_data
-def parse_ist_soll_xml(xml_file_path):
+def parse_ist_soll_xml(xml_file_path, cache_buster=FUTURE_PROFILE_CACHE_KEY):
     """Parst die Kompetenzabgleich_neuV1.xml und extrahiert IST-Mitarbeiter mit Business Roles und SOLL-Mitarbeiter mit Capabilities"""
     try:
         tree = ET.parse(xml_file_path)
@@ -2014,6 +2333,9 @@ def parse_ist_soll_xml(xml_file_path):
                     # Filtere auch Dummy-Mitarbeiter wie "Mitarbeiter/in A", "Mitarbeiter/in B", etc.
                     name_lower = name.lower()
                     is_dummy = False
+                    future_actor_whitelist = {
+                        f"mitarbeiter/in {letter}" for letter in ['a', 'b', 'c', 'd', 'e']
+                    }
                     
                     # Prüfe auf Dummy-Muster: "Mitarbeiter/in A", "Mitarbeiter A", "Mitarbeiter/in B", etc.
                     dummy_patterns = [
@@ -2033,6 +2355,9 @@ def parse_ist_soll_xml(xml_file_path):
                         if len(name_parts) == 2 and name_parts[0] == 'mitarbeiter' and len(name_parts[1]) == 1:
                             is_dummy = True
                     
+                    if name_lower in future_actor_whitelist:
+                        is_dummy = False
+                    
                     if name_lower not in ['kunde', 'customer', 'kommune'] and not is_dummy:
                         alle_business_actors.append({
                             'identifier': element_id,
@@ -2041,7 +2366,9 @@ def parse_ist_soll_xml(xml_file_path):
                 elif 'BusinessRole' in element_type:
                     business_roles[element_id] = name
                 elif 'Resource' in element_type:
-                    resources[element_id] = name
+                    cleaned_name = clean_skill_label(name)
+                    if cleaned_name:
+                        resources[element_id] = cleaned_name
                 elif 'Grouping' in element_type:
                     groupings[element_id] = name
         
@@ -2095,9 +2422,13 @@ def parse_ist_soll_xml(xml_file_path):
         
         # 3. Kategorisiere Business Actors in IST basierend auf ihren Beziehungen
         ist_mitarbeiter = []
+        future_actor_whitelist = {
+            f"mitarbeiter/in {letter}" for letter in ['a', 'b', 'c', 'd', 'e']
+        }
         
         for actor in alle_business_actors:
             actor_id = actor['identifier']
+            actor_name_lower = actor['name'].lower()
             
             # Prüfe Assignment-Beziehungen zu Business Roles
             hat_assignment_zu_role = False
@@ -2107,7 +2438,7 @@ def parse_ist_soll_xml(xml_file_path):
                     break
             
             # IST-Mitarbeiter = hat Assignment zu BusinessRole (hat Berufsbezeichnung)
-            if hat_assignment_zu_role:
+            if hat_assignment_zu_role and actor_name_lower not in future_actor_whitelist:
                 ist_mitarbeiter.append(actor)
             # Alle anderen Business Actors ohne Berufsbezeichnung werden ignoriert
             # (SOLL-Fähigkeiten kommen direkt aus Groupings, nicht aus Business Actors)
@@ -2176,7 +2507,16 @@ def parse_ist_soll_xml(xml_file_path):
                 for resource in grouping_resources[grouping_id]:
                     soll_faehigkeiten.add(resource)
         
-        soll_faehigkeiten_liste = sorted(list(soll_faehigkeiten))
+        future_profiles = extract_future_profiles(alle_business_actors, associations, groupings, grouping_resources)
+        if future_profiles:
+            aggregated_skills = []
+            for profile in future_profiles:
+                aggregated_skills.extend(profile.get('skills', []))
+            soll_faehigkeiten_liste = aggregated_skills
+            soll_total_skill_count = sum(len(profile.get('skills', [])) for profile in future_profiles)
+        else:
+            soll_faehigkeiten_liste = sorted(list(soll_faehigkeiten))
+            soll_total_skill_count = len(soll_faehigkeiten_liste)
         
         # Debug-Informationen
         debug_info = {
@@ -2190,14 +2530,17 @@ def parse_ist_soll_xml(xml_file_path):
             'associations_count': len(associations),
             'compositions_count': len(compositions),
             'ist_mit_rollen_count': len(ist_mitarbeiter_mit_rollen),
-            'soll_faehigkeiten_count': len(soll_faehigkeiten_liste)
+            'soll_faehigkeiten_count': len(soll_faehigkeiten_liste),
+            'soll_total_skill_count': soll_total_skill_count
         }
         
         return {
             'ist_mitarbeiter': ist_mitarbeiter_mit_rollen,
             'soll_faehigkeiten': soll_faehigkeiten_liste,
             'success': True,
-            'debug': debug_info
+            'debug': debug_info,
+            'soll_profile_map': future_profiles,
+            'soll_total_skill_count': soll_total_skill_count
         }
         
     except Exception as e:
@@ -2205,6 +2548,7 @@ def parse_ist_soll_xml(xml_file_path):
         return {
             'ist_mitarbeiter': [],
             'soll_faehigkeiten': [],
+            'soll_profile_map': [],
             'success': False,
             'error': str(e),
             'traceback': traceback.format_exc()
@@ -2632,7 +2976,7 @@ def main():
     with st.spinner("Lade Daten..."):
         (employees_df, kldb_esco_df, occupation_skill_relations_df, skills_df, eures_skills_df, 
          udemy_courses_df, occupations_df, occupation_skills_mapping, skills_en_df, archi_data, 
-         kompetenzabgleich_data, berufsbenennungen_df) = load_data()
+         kompetenzabgleich_data, berufsbenennungen_df) = load_data(cache_buster=LOAD_DATA_CACHE_VERSION)
     
     if employees_df.empty and kldb_esco_df.empty:
         st.error("Fehler beim Laden der Daten. Bitte überprüfe die CSV-Dateien.")
@@ -3605,6 +3949,7 @@ def show_occupation_matching(employees_df, kldb_esco_df, occupation_skill_relati
         # Erstelle eine Dropdown-Box mit allen verfügbaren KldB-Rollen
         # Entferne Duplikate basierend auf KldB_Code UND KldB_Label
         available_kldb_roles = kldb_esco_df[['KldB_Code', 'KldB_Label']].drop_duplicates(subset=['KldB_Code', 'KldB_Label'])
+        available_kldb_roles = available_kldb_roles[available_kldb_roles['KldB_Label'].apply(is_valid_kldb_label)]
         available_kldb_roles = available_kldb_roles.sort_values('KldB_Label')
         
         # Erstelle Optionen für die Dropdown-Box - kürzere, saubere Anzeige
@@ -5738,7 +6083,7 @@ def show_ist_soll_matching(employees_df, kldb_esco_df, occupation_skill_relation
     
     # Parse XML-Datei
     with st.spinner("Lade und parse XML-Datei..."):
-        xml_data = parse_ist_soll_xml(xml_path)
+        xml_data = parse_ist_soll_xml(xml_path, cache_buster=FUTURE_PROFILE_CACHE_KEY)
     
     if not xml_data['success']:
         st.error(f"Fehler beim Parsen der XML-Datei: {xml_data.get('error', 'Unbekannter Fehler')}")
@@ -5749,6 +6094,7 @@ def show_ist_soll_matching(employees_df, kldb_esco_df, occupation_skill_relation
     
     ist_mitarbeiter = xml_data['ist_mitarbeiter']
     soll_faehigkeiten = xml_data['soll_faehigkeiten']
+    total_soll_skills = xml_data.get('soll_total_skill_count', len(soll_faehigkeiten))
     
     # Zeige Debug-Informationen
     if 'debug' in xml_data:
@@ -5780,7 +6126,7 @@ def show_ist_soll_matching(employees_df, kldb_esco_df, occupation_skill_relation
     st.info(f"""
     **XML-Daten:**
     - **IST-Mitarbeiter:** {len(ist_mitarbeiter)} Mitarbeiter mit Business Roles
-    - **SOLL-Fähigkeiten:** {len(soll_faehigkeiten)} Fähigkeiten für neue Unternehmensstrategie
+    - **SOLL-Fähigkeiten:** {total_soll_skills} Fähigkeiten für neue Unternehmensstrategie
     """)
     
     if not ist_mitarbeiter:
@@ -6115,363 +6461,39 @@ def show_ist_soll_matching(employees_df, kldb_esco_df, occupation_skill_relation
                     st.warning("△ Import durchgeführt, aber Speichern in CSV fehlgeschlagen!")
                     st.info("ℹ Die Mitarbeiter sind im Session State verfügbar, aber nicht dauerhaft gespeichert.")
     
-    # Zeige SOLL-Fähigkeiten (für neue Unternehmensstrategie)
+    # Hinweis: Das Matching wird im folgenden Abschnitt pro SOLL-Profil automatisch berechnet.
+    
+    # Ranking pro zukünftiger SOLL-Rolle
+    future_profiles = xml_data.get('soll_profile_map', [])
+    if not future_profiles:
+        future_profiles = [{
+            'name': 'Aggregiertes SOLL-Profil',
+            'skills': soll_faehigkeiten,
+            'skill_count': len(soll_faehigkeiten)
+        }]
+    
+    for detail in ist_mitarbeiter_mit_details:
+        normalized_set = set()
+        for skill in detail.get('skills', []):
+            norm = normalize_skill_name(skill)
+            if norm:
+                normalized_set.add(norm)
+        detail['normalized_skills_set'] = normalized_set
+    
     st.markdown("---")
-    st.subheader("SOLL-Fähigkeiten (für neue Unternehmensstrategie)")
+    st.subheader("SOLL-Profile & Ranking der IST-Mitarbeiter")
+    total_required_skills = sum(len(profile.get('skills', [])) for profile in future_profiles)
+    st.write(f"**Erfasste zukünftige Skills:** {total_required_skills} (Erwartung laut Modell: 61)")
     
-    st.info(f"**{len(soll_faehigkeiten)} Fähigkeiten** wurden aus der XML-Datei extrahiert und repräsentieren die neue Unternehmensstrategie.")
+    skill_lookup = build_skill_lookup(skills_df)
     
-    # Zeige Fähigkeiten in einer Tabelle
-    faehigkeiten_df = pd.DataFrame({
-        'Fähigkeit': soll_faehigkeiten
-    })
-    st.dataframe(faehigkeiten_df, use_container_width=True, hide_index=True)
-    
-    # Button zum Starten des Matchings
-    if st.button("◈ Matching durchführen", type="primary"):
-        with st.spinner("Berechne Skill-Übereinstimmungen..."):
-            # 1. Verwende bereits ermittelte IST-Mitarbeiter-Skills aus Session State
-            ist_mitarbeiter_skills = {}
-            
-            if 'ist_mitarbeiter_mit_details' in st.session_state:
-                # Verwende die bereits ermittelten Skills
-                for mitarbeiter_detail in st.session_state.ist_mitarbeiter_mit_details:
-                    mitarbeiter_name = mitarbeiter_detail['name']
-                    # Konvertiere Skills zu lowercase für Vergleich
-                    skills_lower = set([skill.lower() for skill in mitarbeiter_detail['skills']])
-                    ist_mitarbeiter_skills[mitarbeiter_name] = skills_lower
-            else:
-                # Fallback: Ermittle Skills neu (falls Session State nicht verfügbar)
-                for mitarbeiter in ist_mitarbeiter:
-                    mitarbeiter_name = mitarbeiter['name']
-                    business_roles = mitarbeiter['business_roles']
-                    
-                    # Finde KldB-Codes für die Business Roles
-                    alle_skills = set()
-                    
-                    for role in business_roles:
-                        # Verwende semantisches Matching für Business Role -> KldB-Code -> ESCO-Rolle
-                        kldb_code, kldb_label, esco_label, esco_code = find_kldb_code_for_business_role_semantic(
-                            role, kldb_esco_df, berufsbenennungen_df, min_similarity=0.2
-                        )
-                        
-                        if kldb_code:
-                            # Hole Skills für diese ESCO-Rolle
-                            role_skills = get_skills_for_occupation_simple(
-                                esco_label,
-                                st.session_state.occupation_skills_mapping,
-                                occupations_df
-                            )
-                            
-                            if role_skills:
-                                for skill in role_skills:
-                                    skill_label = skill.get('skill_label', '')
-                                    if skill_label:
-                                        alle_skills.add(skill_label.lower())
-                    
-                    # Prüfe auch manuelle Skills aus employees_df
-                    employee_match = employees_df[employees_df['Name'].str.contains(mitarbeiter_name, case=False, na=False)]
-                    if not employee_match.empty:
-                        manual_skills = employee_match.iloc[0].get('Manual_Skills', '')
-                        if manual_skills and pd.notna(manual_skills):
-                            for skill in str(manual_skills).split(';'):
-                                if skill.strip():
-                                    alle_skills.add(skill.strip().lower())
-                    
-                    ist_mitarbeiter_skills[mitarbeiter_name] = alle_skills
-            
-            # 2. Normalisiere SOLL-Fähigkeiten
-            soll_faehigkeiten_set = set([skill.lower().strip() for skill in soll_faehigkeiten])
-            
-            # 3. Führe Matching durch mit verbesserter Skill-Normalisierung
-            matching_results = []
-            
-            def normalize_skill(skill):
-                """Normalisiert einen Skill-String für besseren Vergleich"""
-                skill = skill.lower().strip()
-                # Entferne häufige Präfixe/Suffixe
-                skill = skill.replace('skill', '').replace('fähigkeit', '').replace('kompetenz', '')
-                skill = skill.replace('(', '').replace(')', '').replace('-', ' ').replace('_', ' ')
-                # Entferne mehrfache Leerzeichen
-                skill = ' '.join(skill.split())
-                return skill
-            
-            def skills_match(skill1, skill2):
-                """Prüft ob zwei Skills übereinstimmen (exakt oder ähnlich)"""
-                norm1 = normalize_skill(skill1)
-                norm2 = normalize_skill(skill2)
-                
-                # Exakte Übereinstimmung
-                if norm1 == norm2:
-                    return True
-                
-                # Eine enthält die andere
-                if norm1 in norm2 or norm2 in norm1:
-                    return True
-                
-                # Ähnliche Wörter (mindestens 2 gemeinsame Wörter)
-                words1 = set(norm1.split())
-                words2 = set(norm2.split())
-                common_words = words1 & words2
-                if len(common_words) >= 2:
-                    return True
-                
-                return False
-            
-            # Matche jeden IST-Mitarbeiter gegen die SOLL-Fähigkeiten
-            for ist_name, ist_skills_set in ist_mitarbeiter_skills.items():
-                # Finde übereinstimmende Skills (mit Fuzzy-Matching)
-                gemeinsame_skills = []
-                fehlende_skills = []
-                
-                for soll_skill in soll_faehigkeiten_set:
-                    gefunden = False
-                    for ist_skill in ist_skills_set:
-                        if skills_match(soll_skill, ist_skill):
-                            gemeinsame_skills.append(soll_skill)
-                            gefunden = True
-                            break
-                    if not gefunden:
-                        fehlende_skills.append(soll_skill)
-                
-                match_score = len(gemeinsame_skills) / len(soll_faehigkeiten_set) * 100 if soll_faehigkeiten_set else 0
-                
-                matching_results.append({
-                    'IST-Mitarbeiter': ist_name,
-                    'Gemeinsame Fähigkeiten': len(gemeinsame_skills),
-                    'Gesamt SOLL-Fähigkeiten': len(soll_faehigkeiten_set),
-                    'Match-Score (%)': round(match_score, 2),
-                    'Gemeinsame Fähigkeiten Liste': gemeinsame_skills,
-                    'Fehlende Fähigkeiten': fehlende_skills
-                })
-            
-            # Sortiere nach Match-Score
-            matching_results.sort(key=lambda x: x['Match-Score (%)'], reverse=True)
-            
-            # Speichere Ergebnisse im Session State
-            st.session_state.ist_soll_matching_results = matching_results
-            
-            st.success(f"✓ Matching abgeschlossen! {len(matching_results)} Kombinationen analysiert.")
-    
-    # Zeige Matching-Ergebnisse
-    if 'ist_soll_matching_results' in st.session_state:
-        st.markdown("---")
-        st.subheader("Matching-Ergebnisse: IST-Mitarbeiter vs. SOLL-Fähigkeiten")
-        
-        matching_results = st.session_state.ist_soll_matching_results
-        
-        # Sortiere nach Match-Score (beste zuerst)
-        matching_results.sort(key=lambda x: x['Match-Score (%)'], reverse=True)
-        
-        # Zeige Top-Matches
-        st.write(f"**Gefundene Matches:** {len(matching_results)} IST-Mitarbeiter wurden gegen {len(soll_faehigkeiten)} SOLL-Fähigkeiten gematcht.")
-        
-        # Zeige alle Matches sortiert nach Score
-        for i, result in enumerate(matching_results):
-            with st.expander(f"◉ Platz {i+1}: {result['IST-Mitarbeiter']} (Match-Score: {result['Match-Score (%)']:.1f}%)", expanded=False):
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    st.write(f"**IST-Mitarbeiter:** {result['IST-Mitarbeiter']}")
-                    st.write(f"**Match-Score:** {result['Match-Score (%)']:.1f}%")
-                    st.write(f"**Gemeinsame Fähigkeiten:** {result['Gemeinsame Fähigkeiten']}/{result['Gesamt SOLL-Fähigkeiten']}")
-                    
-                    if result['Gemeinsame Fähigkeiten Liste']:
-                        st.write("**Gemeinsame Fähigkeiten:**")
-                        for skill in result['Gemeinsame Fähigkeiten Liste'][:15]:
-                            st.write(f"  ✓ {skill}")
-                        if len(result['Gemeinsame Fähigkeiten Liste']) > 15:
-                            st.write(f"  ... und {len(result['Gemeinsame Fähigkeiten Liste']) - 15} weitere")
-                    else:
-                        st.warning("Keine gemeinsamen Fähigkeiten gefunden.")
-                
-                with col2:
-                    if result['Fehlende Fähigkeiten']:
-                        st.write(f"**Fehlende Fähigkeiten:** {len(result['Fehlende Fähigkeiten'])}")
-                        for skill in result['Fehlende Fähigkeiten'][:15]:
-                            st.write(f"  ✗ {skill}")
-                        if len(result['Fehlende Fähigkeiten']) > 15:
-                            st.write(f"  ... und {len(result['Fehlende Fähigkeiten']) - 15} weitere")
-                    else:
-                        st.success("✓ Alle benötigten Fähigkeiten vorhanden!")
-                
-                # Button zum Anzeigen der Kursempfehlungen
-                if result['Fehlende Fähigkeiten']:
-                    st.markdown("---")
-                    
-                    # Eindeutiger Key für diesen Mitarbeiter
-                    employee_key = f"employee_{i}_{result['IST-Mitarbeiter']}"
-                    
-                    # Initialisiere Session State für Kursempfehlungen
-                    if f"{employee_key}_show_courses" not in st.session_state:
-                        st.session_state[f"{employee_key}_show_courses"] = False
-                    
-                    # Button zum Anzeigen der Kursempfehlungen
-                    if st.button(f"▤ Kursempfehlungen für {result['IST-Mitarbeiter']} anzeigen", key=f"btn_{employee_key}"):
-                        st.session_state[f"{employee_key}_show_courses"] = True
-                        # Speichere auch den ausgewählten Mitarbeiter
-                        st.session_state["selected_employee_for_courses"] = result['IST-Mitarbeiter']
-                        st.session_state["selected_employee_index"] = i
-        
-        # Zeige Kursempfehlungen außerhalb der Expander (nur für ausgewählten Mitarbeiter)
-        if "selected_employee_for_courses" in st.session_state and st.session_state["selected_employee_for_courses"]:
-            selected_employee_name = st.session_state["selected_employee_for_courses"]
-            selected_index = st.session_state.get("selected_employee_index", 0)
-            
-            # Finde den entsprechenden Match-Ergebnis
-            selected_result = None
-            for i, result in enumerate(matching_results):
-                if result['IST-Mitarbeiter'] == selected_employee_name:
-                    selected_result = result
-                    selected_index = i
-                    break
-            
-            if selected_result and selected_result['Fehlende Fähigkeiten']:
-                employee_key = f"employee_{selected_index}_{selected_employee_name}"
-                
-                # Zeige Kursempfehlungen nur wenn Button geklickt wurde
-                if st.session_state.get(f"{employee_key}_show_courses", False):
-                    st.markdown("---")
-                    st.subheader(f"▤ Kursempfehlungen für {selected_employee_name}")
-                    
-                    # Konvertiere fehlende Fähigkeiten in das Format für find_udemy_courses_for_skills
-                    # Erstelle Mapping für Essential/Optional Status
-                    missing_skills_for_courses = []
-                    skill_type_mapping = {}  # skill_name -> 'Essential' oder 'Optional'
-                    
-                    # Prüfe ob Skills Essential oder Optional sind (aus missing_skills falls verfügbar)
-                    for skill_name in selected_result['Fehlende Fähigkeiten']:
-                        # Versuche Skill-URI zu finden
-                        skill_uri = ''
-                        is_essential = False
-                        
-                        for _, skill_row in skills_df.iterrows():
-                            if str(skill_row.get('preferredLabel', '')).lower() == skill_name.lower():
-                                skill_uri = str(skill_row.get('conceptUri', ''))
-                                break
-                        
-                        # Standard: Optional (da wir keine Essential/Optional Info aus dem Matching haben)
-                        skill_type_mapping[skill_name] = 'Optional'
-                        
-                        missing_skills_for_courses.append({
-                            'skill_label': skill_name,
-                            'skill_uri': skill_uri,
-                            'is_essential': is_essential
-                        })
-                    
-                    # Finde Kursempfehlungen nur für diesen Mitarbeiter
-                    with st.spinner("Suche passende Kurse für fehlende Fähigkeiten..."):
-                        course_recommendations = find_udemy_courses_for_skills(
-                            missing_skills_for_courses,
-                            udemy_courses_df,
-                            top_k=3
-                        )
-                    
-                    if course_recommendations:
-                        # Hole favorisierte Skills aus Session State
-                        favorite_skills_uris = set()
-                        if 'favorite_skills' in st.session_state:
-                            favorite_skills_uris = st.session_state.favorite_skills
-                        
-                        # Gruppiere nach Skill
-                        skill_groups = {}
-                        for rec in course_recommendations:
-                            skill_name = rec.get('skill', '')
-                            if not skill_name:
-                                skill_name = rec.get('skill_label', 'Unbekannt')
-                            
-                            skill_uri = rec.get('skill_uri', '')
-                            
-                            if skill_name not in skill_groups:
-                                # Prüfe ob dieser Skill favorisiert ist
-                                is_fav = skill_uri in favorite_skills_uris if skill_uri else False
-                                skill_groups[skill_name] = {
-                                    'courses': [],
-                                    'skill_uri': skill_uri,
-                                    'is_favorite': is_fav
-                                }
-                            skill_groups[skill_name]['courses'].append(rec)
-                        
-                        # Bestimme Skill-Typ für alle Skills
-                        for skill_name, skill_data in skill_groups.items():
-                            skill_type = skill_type_mapping.get(skill_name, 'Optional')
-                            skill_data['skill_type'] = skill_type
-                        
-                        # Sortiere Skills: Favoriten zuerst, dann Essential, dann Optional - alle nach höchstem Kurs-Score
-                        def sort_skill_key(item):
-                            skill_name, skill_data = item
-                            is_favorite = skill_data['is_favorite']
-                            skill_type = skill_data.get('skill_type', 'Optional')
-                            is_essential = (skill_type == "Essential")
-                            
-                            # Sortiere Kurse innerhalb der Gruppe nach Score
-                            courses = skill_data['courses']
-                            courses.sort(key=lambda x: x.get('similarity_score', 0), reverse=True)
-                            
-                            # Berechne höchsten Score
-                            max_score = max([c.get('similarity_score', 0) for c in courses]) if courses else 0
-                            
-                            # Sortierung nach Priorität:
-                            # 1. Favoriten zuerst (0 = Favorit, 1 = Nicht-Favorit)
-                            # 2. Essential vor Optional (aber nur wenn nicht favorisiert)
-                            # 3. Höchster Score (negativ für absteigende Sortierung)
-                            if is_favorite:
-                                # Favoriten: nur nach Score sortieren
-                                return (0, 0, -max_score)
-                            else:
-                                # Nicht-Favoriten: Essential (0) vor Optional (1), dann nach Score
-                                return (1, 1 if not is_essential else 0, -max_score)
-                        
-                        sorted_skill_groups = sorted(skill_groups.items(), key=sort_skill_key)
-                        
-                        for skill_name, skill_data in sorted_skill_groups:
-                            courses = skill_data['courses']
-                            is_favorite = skill_data['is_favorite']
-                            skill_type = skill_data.get('skill_type', 'Optional')
-                            
-                            # Zeige Favorit-Status an
-                            favorite_badge = " ★ FAVORIT" if is_favorite else ""
-                            st.write(f"**Für Skill: {skill_name}** ({skill_type}){favorite_badge}")
-                            
-                            for j, course in enumerate(courses[:3], 1):  # Top 3 Kurse pro Skill
-                                # Zeige Multi-Skill-Info falls vorhanden
-                                num_matched = course.get('num_matched_skills', 1)
-                                matched_skills_list = course.get('matched_skills_list', [])
-                                multi_skill_info = ""
-                                if num_matched > 1:
-                                    multi_skill_info = f" ◉ Deckt {num_matched} Skills ab"
-                                
-                                # Jetzt können wir Expander verwenden, da wir außerhalb des Match-Expanders sind
-                                with st.expander(f"{j}. {course['course_title']} (Score: {course.get('similarity_score', 0):.3f}){multi_skill_info}"):
-                                    if num_matched > 1:
-                                        st.info(f"◉ Dieser Kurs deckt {num_matched} fehlende Skills ab: {', '.join(matched_skills_list)}")
-                                    st.write(f"**Headline:** {course.get('course_headline', 'N/A')}")
-                                    st.write(f"**Beschreibung:** {course.get('course_description', 'N/A')}")
-                                    st.write(f"**Preis:** {course.get('course_price', 'N/A')}")
-                                    st.write(f"**Sprache:** {course.get('course_language', 'N/A')}")
-                                    if course.get('skill_score'):
-                                        st.caption(f"Relevanz für '{skill_name}': {course['skill_score']:.3f}")
-                                    if course.get('course_url'):
-                                        st.markdown(f"[Zum Kurs auf Udemy]({course['course_url']})")
-                            
-                            st.markdown("---")
-                    else:
-                        st.info("Keine passenden Kurse für die fehlenden Fähigkeiten gefunden.")
-        
-        # Zusammenfassungstabelle
-        st.markdown("---")
-        st.markdown("### Zusammenfassung: Ranking der IST-Mitarbeiter")
-        summary_data = []
-        for i, result in enumerate(matching_results):
-            summary_data.append({
-                'Rang': i + 1,
-                'IST-Mitarbeiter': result['IST-Mitarbeiter'],
-                'Match-Score (%)': f"{result['Match-Score (%)']:.1f}%",
-                'Gemeinsame Fähigkeiten': f"{result['Gemeinsame Fähigkeiten']}/{result['Gesamt SOLL-Fähigkeiten']}"
-            })
-        
-        summary_df = pd.DataFrame(summary_data)
-        st.dataframe(summary_df, use_container_width=True, hide_index=True)
+    for profile in future_profiles:
+        render_future_profile_section(
+            profile,
+            ist_mitarbeiter_mit_details,
+            udemy_courses_df,
+            skill_lookup
+        )
 
 
 if __name__ == "__main__":
