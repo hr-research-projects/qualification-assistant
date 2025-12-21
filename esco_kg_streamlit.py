@@ -91,6 +91,7 @@ import unicodedata
 from difflib import SequenceMatcher
 from collections import defaultdict
 import xml.etree.ElementTree as ET
+import tempfile
 warnings.filterwarnings('ignore')
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -685,6 +686,7 @@ def extract_future_profiles(actors, associations, groupings, grouping_resources)
     for actor in actors:
         actor_ids_by_name[actor['name']].append(actor['identifier'])
     
+    # Methode 1: Suche nach BusinessActors mit Namen "Mitarbeiter/in A-E"
     for actor_name, ids in actor_ids_by_name.items():
         if not re.match(r'^Mitarbeiter/in [A-E]$', actor_name):
             continue
@@ -707,6 +709,29 @@ def extract_future_profiles(actors, associations, groupings, grouping_resources)
             'skills': skills_list,
             'skill_count': len(skills_list)
         })
+    
+    # Methode 2: Falls keine Profile über Actors gefunden wurden, suche nach Groupings mit "Ziel-Mitarbeiterrolle" im Namen
+    if not future_profiles:
+        for grouping_id, grouping_name in groupings.items():
+            # Suche nach Pattern "Ziel-Mitarbeiterrolle A", "Ziel-Mitarbeiterrolle B", etc.
+            match = re.search(r'Ziel-Mitarbeiterrolle\s+([A-E])', grouping_name, re.IGNORECASE)
+            if match:
+                letter = match.group(1).upper()
+                profile_name = f"Mitarbeiter/in {letter}"
+                
+                # Sammle Skills aus diesem Grouping
+                skills = set()
+                for skill in grouping_resources.get(grouping_id, []):
+                    if skill:
+                        skills.add(skill)
+                
+                skills_list = sorted(skills, key=lambda s: s.lower())
+                if skills_list:  # Nur hinzufügen, wenn Skills vorhanden
+                    future_profiles.append({
+                        'name': profile_name,
+                        'skills': skills_list,
+                        'skill_count': len(skills_list)
+                    })
     
     future_profiles.sort(key=lambda x: x['name'])
     return future_profiles
@@ -803,30 +828,17 @@ def load_data(cache_buster=LOAD_DATA_CACHE_VERSION):
     try:
         # KldB zu ESCO Mapping
         kldb_esco_df = pd.read_csv(data_path('KldB_to_ESCO_Mapping_clean.csv'))
-        st.success("KldB-ESCO Mapping geladen")
         
         # Alphabetisches Verzeichnis laden und in Mapping integrieren
         berufsbenennungen_df, berufsbenennungen_source = load_berufsbenennungen_dataset()
         if not berufsbenennungen_df.empty:
-            if berufsbenennungen_source == 'xlsx':
-                st.success("Alphabetisches Verzeichnis (XLSX) geladen – Umlaute bleiben erhalten.")
-            elif berufsbenennungen_source:
-                st.info(f"Alphabetisches Verzeichnis aus {berufsbenennungen_source} geladen. Umlaute wurden korrigiert.")
-            else:
-                st.info("Alphabetisches Verzeichnis geladen.")
-            
             kldb_esco_df, label_updates, alias_additions = enhance_kldb_mapping(kldb_esco_df, berufsbenennungen_df)
-            if label_updates:
-                st.info(f"{label_updates} KldB-Bezeichnungen anhand des Alphabetischen Verzeichnisses harmonisiert.")
-            if alias_additions:
-                st.info(f"{alias_additions} zusätzliche KldB-Synonyme verfügbar gemacht.")
         else:
             label_updates = alias_additions = 0
         
         # ESCO Beruf-Skill Beziehungen (die richtige Datei!)
         try:
             occupation_skill_relations_df = pd.read_csv(data_path('occupationSkillRelations_de.csv'), on_bad_lines='skip')
-            st.success("ESCO Beruf-Skill Beziehungen geladen")
         except Exception as e:
             st.error(f"Fehler beim Laden der ESCO Beruf-Skill Beziehungen: {str(e)}")
             occupation_skill_relations_df = pd.DataFrame()
@@ -834,7 +846,6 @@ def load_data(cache_buster=LOAD_DATA_CACHE_VERSION):
         # ESCO Berufe
         try:
             occupations_df = pd.read_csv(data_path('occupations_de.csv'), on_bad_lines='skip')
-            st.success("ESCO Berufe geladen")
         except Exception as e:
             st.error(f"Fehler beim Laden der ESCO Berufe: {str(e)}")
             occupations_df = pd.DataFrame()
@@ -842,7 +853,6 @@ def load_data(cache_buster=LOAD_DATA_CACHE_VERSION):
         # ESCO Skills (Deutsch)
         try:
             skills_df = pd.read_csv(data_path('skills_de.csv'), on_bad_lines='skip')
-            st.success("ESCO Skills (Deutsch) geladen")
         except Exception as e:
             st.error(f"Fehler beim Laden der ESCO Skills (Deutsch): {str(e)}")
             skills_df = pd.DataFrame()
@@ -850,7 +860,6 @@ def load_data(cache_buster=LOAD_DATA_CACHE_VERSION):
         # ESCO Skills (Englisch)
         try:
             skills_en_df = pd.read_csv(data_path('skills_en.csv'), on_bad_lines='skip')
-            st.success("ESCO Skills (Englisch) geladen")
         except Exception as e:
             st.error(f"Fehler beim Laden der ESCO Skills (Englisch): {str(e)}")
             skills_en_df = pd.DataFrame()
@@ -858,7 +867,6 @@ def load_data(cache_buster=LOAD_DATA_CACHE_VERSION):
         # EURES Skills Mapping
         try:
             eures_skills_df = pd.read_csv(data_path('EURESmapping_skills_DE.csv'), on_bad_lines='skip')
-            st.success("EURES Skills Mapping geladen")
         except Exception as e:
             st.error(f"Fehler beim Laden des EURES Skills Mappings: {str(e)}")
             eures_skills_df = pd.DataFrame()
@@ -866,7 +874,6 @@ def load_data(cache_buster=LOAD_DATA_CACHE_VERSION):
         # Udemy Kurse
         try:
             udemy_courses_df = pd.read_csv(data_path('Udemy_Course_Desc.csv'), on_bad_lines='skip')
-            st.success("Udemy Kurse geladen")
         except Exception as e:
             st.error(f"Fehler beim Laden der Udemy Kurse: {str(e)}")
             udemy_courses_df = pd.DataFrame()
@@ -874,12 +881,9 @@ def load_data(cache_buster=LOAD_DATA_CACHE_VERSION):
         # Mitarbeiterdaten - Lade zuerst aus employees_data.csv, dann Fallback auf employee_input.csv
         try:
             employees_df = load_employees_from_csv()
-            if not employees_df.empty:
-                st.success("Mitarbeiterdaten aus employees_data.csv geladen")
-            else:
+            if employees_df.empty:
                 # Fallback auf employee_input.csv
                 employees_df = pd.read_csv(data_path('employee_input.csv'))
-                st.success("Mitarbeiterdaten aus employee_input.csv geladen")
         except Exception as e:
             st.error(f"Fehler beim Laden der Mitarbeiterdaten: {str(e)}")
             employees_df = pd.DataFrame(columns=['Employee_ID', 'Name', 'KldB_5_digit', 'Manual_Skills', 'ESCO_Role'])
@@ -891,14 +895,10 @@ def load_data(cache_buster=LOAD_DATA_CACHE_VERSION):
         archi_xml_path = data_path('DigiVan.xml')
         archi_data = None
         if os.path.exists(archi_xml_path):
-            st.write(f"XML-Datei gefunden: {archi_xml_path}")
-            st.write(f"Dateigröße: {os.path.getsize(archi_xml_path)} Bytes")
             
             try:
                 archi_data = parse_archi_xml(archi_xml_path)
-                if archi_data:
-                    st.success(f"Archi XML-Daten erfolgreich geladen: {len(archi_data.get('capabilities', []))} Capabilities, {len(archi_data.get('resources', []))} Resources")
-                else:
+                if not archi_data:
                     st.warning("Archi XML-Daten konnten nicht geparst werden")
             except Exception as e:
                 st.error(f"Fehler beim Laden der XML-Daten: {str(e)}")
@@ -913,16 +913,14 @@ def load_data(cache_buster=LOAD_DATA_CACHE_VERSION):
         if os.path.exists(kompetenzabgleich_xml_path):
             try:
                 kompetenzabgleich_data = parse_kompetenzabgleich_xml(kompetenzabgleich_xml_path)
-                if kompetenzabgleich_data and kompetenzabgleich_data.get('success'):
-                    st.success(f"Kompetenzabgleich XML-Daten erfolgreich geladen: {len(kompetenzabgleich_data.get('ist_rollen', []))} IST-Rollen, {len(kompetenzabgleich_data.get('soll_skills', []))} SOLL-Skills")
-                else:
+                if not (kompetenzabgleich_data and kompetenzabgleich_data.get('success')):
                     st.warning("Kompetenzabgleich XML-Daten konnten nicht geladen werden")
             except Exception as e:
                 st.error(f"Fehler beim Laden der Kompetenzabgleich XML-Daten: {str(e)}")
                 kompetenzabgleich_data = None
         else:
-            st.warning(f"Kompetenzabgleich XML-Datei nicht gefunden: {kompetenzabgleich_xml_path}")
-            st.write(f"**Erwarteter Pfad:** {kompetenzabgleich_xml_path}")
+            # Datei nicht gefunden - keine Warnung anzeigen
+            pass
         
         return (employees_df, kldb_esco_df, occupation_skill_relations_df, skills_df, 
                 eures_skills_df, udemy_courses_df, occupations_df, occupation_skills_mapping, skills_en_df, archi_data, kompetenzabgleich_data, berufsbenennungen_df)
@@ -2174,7 +2172,6 @@ def parse_kompetenzabgleich_xml(xml_file_path):
                 })
         
         # Debug-Informationen
-        st.info(f"Debug: Gefundene Elemente - BusinessActor: {len(ist_rollen)}, Capability: {len(soll_skills)}")
         
         return {
             'ist_rollen': ist_rollen,
@@ -2969,6 +2966,34 @@ def find_best_job_matches_for_capabilities(capabilities, occupations_df, kldb_es
     return all_matches
 
 def main():
+    # Copyright-Footer unten links - immer sichtbar (am Anfang, damit er auf allen Seiten erscheint)
+    st.markdown("""
+    <style>
+    .streamlit-footer {
+        position: fixed !important;
+        bottom: 0 !important;
+        left: 0 !important;
+        padding: 8px 15px !important;
+        background-color: rgba(255, 255, 255, 0.95) !important;
+        color: #666 !important;
+        font-size: 0.75rem !important;
+        z-index: 999999 !important;
+        width: auto !important;
+        border-top: 1px solid rgba(0, 0, 0, 0.1) !important;
+        border-right: 1px solid rgba(0, 0, 0, 0.1) !important;
+        border-top-right-radius: 4px !important;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
+        box-shadow: 0 -2px 4px rgba(0, 0, 0, 0.1) !important;
+        pointer-events: auto !important;
+    }
+    /* Stelle sicher, dass Footer nicht versteckt wird */
+    footer { display: none !important; }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    # Footer als separates Element
+    st.markdown('<div class="streamlit-footer">© Ali Copurkuyu & Süleyman Omurca</div>', unsafe_allow_html=True)
+    
     st.title("Kompetenzabgleich & Weiterbildungsempfehlungen")
     st.markdown("---")
     
@@ -3037,13 +3062,9 @@ def main():
                     'ESCO_Label': target_esco_label
                 }
                 
-                # Zeige Benachrichtigung über wiederhergestellte Zielrolle
+                # Zielrolle wurde wiederhergestellt (keine Benachrichtigung anzeigen)
                 if 'target_role_restored' not in st.session_state:
                     st.session_state.target_role_restored = True
-                    st.success(f"Gespeicherte Zielrolle für {employee_row.get('Name', current_employee_id)} wiederhergestellt: {target_kldb_label}")
-                else:
-                    # Zeige Benachrichtigung über wiederhergestellte Zielrolle beim Mitarbeiterwechsel
-                    st.success(f"Gespeicherte Zielrolle für {employee_row.get('Name', current_employee_id)} wiederhergestellt: {target_kldb_label}")
     
 
     
@@ -3950,11 +3971,19 @@ def show_occupation_matching(employees_df, kldb_esco_df, occupation_skill_relati
         # Entferne Duplikate basierend auf KldB_Code UND KldB_Label
         available_kldb_roles = kldb_esco_df[['KldB_Code', 'KldB_Label']].drop_duplicates(subset=['KldB_Code', 'KldB_Label'])
         available_kldb_roles = available_kldb_roles[available_kldb_roles['KldB_Label'].apply(is_valid_kldb_label)]
+        # Entferne weitere Duplikate: Wenn Code+Label identisch sind, behalte nur einen
+        available_kldb_roles = available_kldb_roles.drop_duplicates(subset=['KldB_Code', 'KldB_Label'], keep='first')
+        
+        # WICHTIG: Entferne Duplikate basierend auf Label - wenn mehrere Codes dasselbe Label haben,
+        # behalte nur den ersten (um Duplikate in der Dropdown-Liste zu vermeiden)
+        available_kldb_roles = available_kldb_roles.drop_duplicates(subset=['KldB_Label'], keep='first')
+        
         available_kldb_roles = available_kldb_roles.sort_values('KldB_Label')
         
-        # Erstelle Optionen für die Dropdown-Box - kürzere, saubere Anzeige
+        # Erstelle Optionen für die Dropdown-Box - eindeutig und ohne Duplikate
         kldb_options = []
-        seen_options = set()  # Verhindert Duplikate in der Anzeige
+        seen_labels = set()  # Verhindert Duplikate basierend auf Label
+        seen_codes = set()  # Verhindert Duplikate basierend auf Code
         
         for _, row in available_kldb_roles.iterrows():
             kldb_label = str(row['KldB_Label']).strip()
@@ -3964,18 +3993,23 @@ def show_occupation_matching(employees_df, kldb_esco_df, occupation_skill_relati
             if not kldb_label or not kldb_code or kldb_label == 'nan' or kldb_code == 'nan':
                 continue
             
-            # Kürze lange Labels für bessere Lesbarkeit
-            display_label = kldb_label
-            if len(display_label) > 40:
-                display_label = display_label[:37] + "..."
+            # Normalisiere Label für Vergleich (entferne führende/nachfolgende Leerzeichen, normalisiere Groß-/Kleinschreibung)
+            normalized_label = kldb_label.strip()
             
-            # Erstelle saubere Option
-            option = f"{display_label} | {kldb_code}"
+            # Überspringe, wenn dieses Label bereits existiert (verhindert Duplikate)
+            if normalized_label in seen_labels:
+                continue
             
-            # Verhindere Duplikate in der Anzeige
-            if option not in seen_options:
-                kldb_options.append(option)
-                seen_options.add(option)
+            # Überspringe, wenn dieser Code bereits existiert (zusätzliche Sicherheit)
+            if kldb_code in seen_codes:
+                continue
+            
+            seen_labels.add(normalized_label)
+            seen_codes.add(kldb_code)
+            
+            # Erstelle eindeutige Option
+            option = f"{kldb_label} | {kldb_code}"
+            kldb_options.append(option)
         
         # Sortiere die Optionen alphabetisch
         kldb_options.sort()
@@ -3985,18 +4019,26 @@ def show_occupation_matching(employees_df, kldb_esco_df, occupation_skill_relati
         
         # Zeige dynamische Übersicht basierend auf aktueller Auswahl
         if selected_target_role and selected_target_role != "Bitte wählen Sie eine neue Zielrolle...":
-            # Extrahiere KldB-Code aus der Auswahl
+            # Extrahiere KldB-Code und Label aus der Auswahl
             kldb_code = selected_target_role.split(" | ")[1]
             kldb_label = selected_target_role.split(" | ")[0]
             
-            # Finde das vollständige Label aus den Originaldaten
-            full_label = available_kldb_roles[
-                (available_kldb_roles['KldB_Code'] == kldb_code) & 
-                (available_kldb_roles['KldB_Label'].str.contains(kldb_label.split('...')[0] if '...' in kldb_label else kldb_label, na=False))
-            ]['KldB_Label'].iloc[0] if not available_kldb_roles[
-                (available_kldb_roles['KldB_Code'] == kldb_code) & 
-                (available_kldb_roles['KldB_Label'].str.contains(kldb_label.split('...')[0] if '...' in kldb_label else kldb_label, na=False))
-            ].empty else kldb_label
+            # Finde das vollständige Label aus den ORIGINALDATEN (kldb_esco_df), nicht aus available_kldb_roles
+            # Suche nach dem Label in den Originaldaten, um den korrekten Code zu finden
+            matching_rows = kldb_esco_df[
+                (kldb_esco_df['KldB_Label'].str.strip() == kldb_label.strip()) |
+                (kldb_esco_df['KldB_Label'].str.contains(kldb_label.split('...')[0] if '...' in kldb_label else kldb_label, case=False, na=False))
+            ]
+            
+            if not matching_rows.empty:
+                # Verwende den ersten gefundenen Eintrag
+                first_match = matching_rows.iloc[0]
+                full_label = first_match['KldB_Label']
+                # Verwende den Code aus den Originaldaten, nicht aus der gefilterten Liste
+                kldb_code = first_match['KldB_Code']
+            else:
+                # Fallback: Verwende die extrahierten Werte
+                full_label = kldb_label
             
             # Zeige dynamische Übersicht der ausgewählten KldB-Rolle
             st.markdown("---")
@@ -4004,7 +4046,23 @@ def show_occupation_matching(employees_df, kldb_esco_df, occupation_skill_relati
             st.write(f"• KldB: {full_label} ({kldb_code})")
             
             # Finde alle ESCO-Rollen für die ausgewählte KldB-Rolle
-            target_roles = get_unique_esco_roles(kldb_esco_df, kldb_code)
+            # Suche nach allen Codes, die zu diesem Label gehören (falls mehrere Codes dasselbe Label haben)
+            all_matching_codes = kldb_esco_df[
+                kldb_esco_df['KldB_Label'].str.strip() == full_label.strip()
+            ]['KldB_Code'].unique()
+            
+            # Sammle alle ESCO-Rollen für alle passenden Codes
+            target_roles_list = []
+            for code in all_matching_codes:
+                roles = get_unique_esco_roles(kldb_esco_df, code)
+                if not roles.empty:
+                    target_roles_list.append(roles)
+            
+            # Kombiniere alle gefundenen Rollen
+            if target_roles_list:
+                target_roles = pd.concat(target_roles_list, ignore_index=True).drop_duplicates(subset=['ESCO_Code', 'ESCO_Label'])
+            else:
+                target_roles = pd.DataFrame()
             
             if not target_roles.empty:
                 st.write(f"**Verfügbare ESCO-Rollen für Zielrolle '{full_label}':**")
@@ -4058,123 +4116,121 @@ def show_occupation_matching(employees_df, kldb_esco_df, occupation_skill_relati
                                         st.session_state.current_target_role_key = f"select_target_role_{idx}"
                                         st.success(f"Match berechnet für {esco_label}")
                                         st.rerun()
-            
-            # Zeige Rollenvergleich-Übersicht, wenn Match vorhanden ist und für "Zielrolle auswählen"
-            if ('current_match' in st.session_state and st.session_state.current_match and 
-                ('current_target_role_key' not in st.session_state or 'skill_based' not in st.session_state.get('current_target_role_key', ''))):
-                match_result = st.session_state.current_match
                 
-                st.markdown("---")
-                # Zeige Match-Ergebnisse
-                st.subheader("Rollenvergleich")
-                
-                # Match-Ergebnisse
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    if match_result['has_target_skills']:
-                        st.metric("Fit-Score % (nicht gewichtet)", f"{match_result['match_percentage']:.1f}%", help="Berechnet den prozentualen Anteil der Skills, die der Mitarbeiter bereits besitzt, im Verhältnis zu allen benötigten Skills der Zielrolle. Jeder Skill wird gleich gewichtet, unabhängig von seiner Wichtigkeit.")
-                    else:
-                        st.metric("Fit-Score % (nicht gewichtet)", "N/A", help="Berechnet den prozentualen Anteil der Skills, die der Mitarbeiter bereits besitzt, im Verhältnis zu allen benötigten Skills der Zielrolle. Jeder Skill wird gleich gewichtet, unabhängig von seiner Wichtigkeit.")
-                
-                with col2:
-                    if match_result['has_target_skills']:
-                        st.metric("Fit-Score % (gewichtet)", f"{match_result['weighted_fit_percentage']:.1f}%", help="Berechnet den gewichteten Fit-Score, bei dem Essential Skills doppelt zählen (Gewichtung 2) und Optional Skills einfach (Gewichtung 1). Diese Berechnung gibt einen realistischeren Eindruck der Eignung, da kritische Kompetenzen stärker berücksichtigt werden.")
-                    else:
-                        st.metric("Fit-Score % (gewichtet)", "N/A", help="Berechnet den gewichteten Fit-Score, bei dem Essential Skills doppelt zählen (Gewichtung 2) und Optional Skills einfach (Gewichtung 1). Diese Berechnung gibt einen realistischeren Eindruck der Eignung, da kritische Kompetenzen stärker berücksichtigt werden.")
-                
-                st.markdown("---")
-                
-                # Mitarbeitervergleich für diese Zielrolle
-                st.subheader("Vergleich mit anderen Mitarbeitern")
-                
-                # Berechne Vergleich mit anderen Mitarbeitern
-                with st.spinner("Berechne Vergleich mit anderen Mitarbeitern..."):
-                    all_employee_scores = compare_employees_for_target_role(
-                        match_result['target_role'], 
-                        st.session_state.employees_data, 
-                        kldb_esco_df, 
-                        occupation_skill_relations_df, 
-                        skills_df, 
-                        st.session_state.occupation_skills_mapping, 
-                        occupations_df
-                    )
-                
-                if all_employee_scores:
-                    # Finde den aktuellen Mitarbeiter in der Liste
-                    current_employee_id = st.session_state.current_employee_id
-                    current_employee_rank = None
-                    current_employee_score = None
+                # Zeige Rollenvergleich-Übersicht, wenn Match vorhanden ist und für "Zielrolle auswählen"
+                if ('current_match' in st.session_state and st.session_state.current_match and 
+                    ('current_target_role_key' not in st.session_state or 'skill_based' not in st.session_state.get('current_target_role_key', ''))):
+                    match_result = st.session_state.current_match
                     
-                    for i, score in enumerate(all_employee_scores):
-                        if score['employee_id'] == current_employee_id:
-                            current_employee_rank = i + 1
-                            current_employee_score = score
-                            break
+                    st.markdown("---")
+                    # Zeige Match-Ergebnisse
+                    st.subheader("Rollenvergleich")
                     
-                    if current_employee_rank and current_employee_score:
-                        # Filtere nur Mitarbeiter mit besserem Score
-                        better_employees = [score for score in all_employee_scores 
-                                         if score['weighted_fit_percentage'] > current_employee_score['weighted_fit_percentage']]
-                        
-                        if better_employees:
-                            st.info(f"**Ihr aktueller Mitarbeiter belegt Platz {current_employee_rank} von {len(all_employee_scores)} Mitarbeitern für diese Zielrolle.**")
-                            st.warning(f"**Es gibt {len(better_employees)} Mitarbeiter mit einem besseren Fit-Score für diese Zielrolle:**")
-                            
-                            # Zeige Mitarbeiter mit besserem Score
-                            st.write("**Mitarbeiter mit besserem Fit-Score:**")
-                            
-                            # Erstelle DataFrame für bessere Darstellung
-                            better_employees_data = []
-                            for i, score in enumerate(better_employees):
-                                better_employees_data.append({
-                                    'Rang': all_employee_scores.index(score) + 1,
-                                    'Mitarbeiter': score['employee_name'],
-                                    'Aktuelle Rolle': score['current_role'],
-                                    'Fit-Score (gewichtet)': f"{score['weighted_fit_percentage']:.1f}%",
-                                    'Fit-Score (nicht gewichtet)': f"{score['match_percentage']:.1f}%",
-                                    'Matching Skills': score['matching_skills_count'],
-                                    'Fehlende Skills': score['missing_skills_count'],
-                                    'Score-Differenz': f"+{score['weighted_fit_percentage'] - current_employee_score['weighted_fit_percentage']:.1f}%"
-                                })
-                            
-                            comparison_df = pd.DataFrame(better_employees_data)
-                            st.dataframe(comparison_df, use_container_width=True, hide_index=True)
-                            
-                            # Zeige zusätzliche Informationen
-                            best_score = better_employees[0]
-                            score_difference = best_score['weighted_fit_percentage'] - current_employee_score['weighted_fit_percentage']
-                            st.warning(f"Der beste Mitarbeiter ({best_score['employee_name']}) hat einen {score_difference:.1f}% höheren Fit-Score.")
+                    # Match-Ergebnisse
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        if match_result['has_target_skills']:
+                            st.metric("Fit-Score % (nicht gewichtet)", f"{match_result['match_percentage']:.1f}%", help="Berechnet den prozentualen Anteil der Skills, die der Mitarbeiter bereits besitzt, im Verhältnis zu allen benötigten Skills der Zielrolle. Jeder Skill wird gleich gewichtet, unabhängig von seiner Wichtigkeit.")
                         else:
-                            st.success("**Dieser Mitarbeiter ist der beste Kandidat für diese Zielrolle!**")
-                            st.info(f"Von {len(all_employee_scores)} Mitarbeitern hat keiner einen besseren Fit-Score.")
+                            st.metric("Fit-Score % (nicht gewichtet)", "N/A", help="Berechnet den prozentualen Anteil der Skills, die der Mitarbeiter bereits besitzt, im Verhältnis zu allen benötigten Skills der Zielrolle. Jeder Skill wird gleich gewichtet, unabhängig von seiner Wichtigkeit.")
+                    
+                    with col2:
+                        if match_result['has_target_skills']:
+                            st.metric("Fit-Score % (gewichtet)", f"{match_result['weighted_fit_percentage']:.1f}%", help="Berechnet den gewichteten Fit-Score, bei dem Essential Skills doppelt zählen (Gewichtung 2) und Optional Skills einfach (Gewichtung 1). Diese Berechnung gibt einen realistischeren Eindruck der Eignung, da kritische Kompetenzen stärker berücksichtigt werden.")
+                        else:
+                            st.metric("Fit-Score % (gewichtet)", "N/A", help="Berechnet den gewichteten Fit-Score, bei dem Essential Skills doppelt zählen (Gewichtung 2) und Optional Skills einfach (Gewichtung 1). Diese Berechnung gibt einen realistischeren Eindruck der Eignung, da kritische Kompetenzen stärker berücksichtigt werden.")
+                    
+                    st.markdown("---")
+                    
+                    # Mitarbeitervergleich für diese Zielrolle
+                    st.subheader("Vergleich mit anderen Mitarbeitern")
+                    
+                    # Berechne Vergleich mit anderen Mitarbeitern
+                    with st.spinner("Berechne Vergleich mit anderen Mitarbeitern..."):
+                        all_employee_scores = compare_employees_for_target_role(
+                            match_result['target_role'], 
+                            st.session_state.employees_data, 
+                            kldb_esco_df, 
+                            occupation_skill_relations_df, 
+                            skills_df, 
+                            st.session_state.occupation_skills_mapping, 
+                            occupations_df
+                        )
+                    
+                    if all_employee_scores:
+                        # Finde den aktuellen Mitarbeiter in der Liste
+                        current_employee_id = st.session_state.current_employee_id
+                        current_employee_rank = None
+                        current_employee_score = None
+                        
+                        for i, score in enumerate(all_employee_scores):
+                            if score['employee_id'] == current_employee_id:
+                                current_employee_rank = i + 1
+                                current_employee_score = score
+                                break
+                        
+                        if current_employee_rank and current_employee_score:
+                            # Filtere nur Mitarbeiter mit besserem Score
+                            better_employees = [score for score in all_employee_scores 
+                                             if score['weighted_fit_percentage'] > current_employee_score['weighted_fit_percentage']]
+                            
+                            if better_employees:
+                                st.info(f"**Ihr aktueller Mitarbeiter belegt Platz {current_employee_rank} von {len(all_employee_scores)} Mitarbeitern für diese Zielrolle.**")
+                                st.warning(f"**Es gibt {len(better_employees)} Mitarbeiter mit einem besseren Fit-Score für diese Zielrolle:**")
+                                
+                                # Zeige Mitarbeiter mit besserem Score
+                                st.write("**Mitarbeiter mit besserem Fit-Score:**")
+                                
+                                # Erstelle DataFrame für bessere Darstellung
+                                better_employees_data = []
+                                for i, score in enumerate(better_employees):
+                                    better_employees_data.append({
+                                        'Rang': all_employee_scores.index(score) + 1,
+                                        'Mitarbeiter': score['employee_name'],
+                                        'Aktuelle Rolle': score['current_role'],
+                                        'Fit-Score (gewichtet)': f"{score['weighted_fit_percentage']:.1f}%",
+                                        'Fit-Score (nicht gewichtet)': f"{score['match_percentage']:.1f}%",
+                                        'Matching Skills': score['matching_skills_count'],
+                                        'Fehlende Skills': score['missing_skills_count'],
+                                        'Score-Differenz': f"+{score['weighted_fit_percentage'] - current_employee_score['weighted_fit_percentage']:.1f}%"
+                                    })
+                                
+                                comparison_df = pd.DataFrame(better_employees_data)
+                                st.dataframe(comparison_df, use_container_width=True, hide_index=True)
+                                
+                                # Zeige zusätzliche Informationen
+                                best_score = better_employees[0]
+                                score_difference = best_score['weighted_fit_percentage'] - current_employee_score['weighted_fit_percentage']
+                                st.warning(f"Der beste Mitarbeiter ({best_score['employee_name']}) hat einen {score_difference:.1f}% höheren Fit-Score.")
+                            else:
+                                st.success("**Dieser Mitarbeiter ist der beste Kandidat für diese Zielrolle!**")
+                                st.info(f"Von {len(all_employee_scores)} Mitarbeitern hat keiner einen besseren Fit-Score.")
+                        else:
+                            st.warning("Aktueller Mitarbeiter konnte nicht in der Vergleichsliste gefunden werden.")
                     else:
-                        st.warning("Aktueller Mitarbeiter konnte nicht in der Vergleichsliste gefunden werden.")
-                else:
-                    st.info("Keine anderen Mitarbeiter für den Vergleich verfügbar.")
-                
-                st.markdown("---")
-                
-                # Fehlende und vorhandene Skills
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    if match_result['missing_skills']:
-                        st.write("**Fehlende Skills für neue Rolle:**")
-                        render_missing_skills_with_favorites(match_result['missing_skills'], session_key_prefix="favorite_main")
-                    else:
-                        st.write("**Fehlende Skills:**")
-                        st.write("Alle benötigten Skills sind vorhanden!")
-                
-                with col2:
-                    if match_result['matching_skills']:
-                        st.write("**Bereits vorhandene Skills:**")
-                        render_skills_two_columns_table(match_result['matching_skills'], left_title="Essentiell", right_title="Optional")
-                    else:
-                        st.write("**Bereits vorhandene Skills:**")
-                        st.write("Keine Übereinstimmungen gefunden.")
-                
-                # Match-Ergebnis ist bereits im Session State gespeichert
+                        st.info("Keine anderen Mitarbeiter für den Vergleich verfügbar.")
+                    
+                    st.markdown("---")
+                    
+                    # Fehlende und vorhandene Skills
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        if match_result['missing_skills']:
+                            st.write("**Fehlende Skills für neue Rolle:**")
+                            render_missing_skills_with_favorites(match_result['missing_skills'], session_key_prefix="favorite_main")
+                        else:
+                            st.write("**Fehlende Skills:**")
+                            st.write("Alle benötigten Skills sind vorhanden!")
+                    
+                    with col2:
+                        if match_result['matching_skills']:
+                            st.write("**Bereits vorhandene Skills:**")
+                            render_skills_two_columns_table(match_result['matching_skills'], left_title="Essentiell", right_title="Optional")
+                        else:
+                            st.write("**Bereits vorhandene Skills:**")
+                            st.write("Keine Übereinstimmungen gefunden.")
             else:
                 st.warning(f"Keine ESCO-Rollen für Zielrolle '{full_label}' gefunden.")
         else:
@@ -5069,8 +5125,6 @@ def show_strategic_development(employees_df, kldb_esco_df, occupation_skill_rela
         # Versuche die XML-Datei manuell zu laden
         xml_path = data_path('DigiVan.xml')
         if os.path.exists(xml_path):
-            st.write(f"XML-Datei gefunden: {xml_path}")
-            st.write(f"Dateigröße: {os.path.getsize(xml_path)} Bytes")
             
             # Versuche manuelles Parsen
             if st.button("XML-Datei manuell neu laden", key="reload_xml_manual"):
@@ -5426,7 +5480,7 @@ def show_xml_based_competency_analysis(employees_df, kldb_esco_df, occupation_sk
     digivan_path = data_path("DigiVan.xml")
     
     if not os.path.exists(kompetenzabgleich_path):
-        st.error(f"Kompetenzabgleich XML-Datei nicht gefunden: {kompetenzabgleich_path}")
+        # Datei nicht gefunden - keine Fehlermeldung anzeigen
         return
     
     if not os.path.exists(digivan_path):
@@ -6072,57 +6126,377 @@ def show_xml_based_competency_analysis(employees_df, kldb_esco_df, occupation_sk
 def show_ist_soll_matching(employees_df, kldb_esco_df, occupation_skill_relations_df, skills_df, eures_skills_df, occupations_df, skills_en_df, udemy_courses_df, berufsbenennungen_df):
     """Zeigt die IST-SOLL-Matching-Funktionalität mit integrierten Kursempfehlungen"""
     st.header("Personalplanung mit Kursempfehlung")
+    
+    # Logo-Pfad - direktes Logo aus Projektverzeichnis
+    logo_path = os.path.join(BASE_DIR, "LOGO_FutureFit_Planning.png")
+    
+    # Prüfe ob Logo existiert, sonst Fallback-Pfade
+    if not os.path.exists(logo_path):
+        possible_logo_paths = [
+            os.path.join(BASE_DIR, "LOGO_FutureFit_Planning.png"),
+            data_path("LOGO_FutureFit_Planning.png"),
+            os.path.join(BASE_DIR, "futurefit_logo.png"),
+            data_path("futurefit_logo.png"),
+        ]
+        for path in possible_logo_paths:
+            if os.path.exists(path):
+                logo_path = path
+                break
+    
+    # Kompaktes Layout: Logo rechts, Unterüberschrift links
+    if logo_path and os.path.exists(logo_path):
+        # Kompakter Container ohne Hintergrund-Fläche
+        # Logo und Unterüberschrift nebeneinander
+        col1, col2 = st.columns([2.5, 1.3])
+        with col1:
+            # Unterüberschrift links
+            st.markdown("""
+            <div style="
+                display: flex;
+                align-items: center;
+                height: 100%;
+                padding-right: 15px;
+                margin: 5px 0;
+            ">
+                <h2 style="
+                    margin: 0; 
+                    color: #6BB6FF; 
+                    font-weight: 700; 
+                    font-size: 1.65rem;
+                    line-height: 1.4;
+                    text-shadow: 0 1px 2px rgba(107, 182, 255, 0.2);
+                ">
+                    FutureFit Planning: Automatisierter Kompetenzabgleich für morgen
+                </h2>
+            </div>
+            """, unsafe_allow_html=True)
+        with col2:
+            # Logo rechts oben - groß und prominent
+            st.markdown("""
+            <div style="
+                display: flex;
+                justify-content: flex-end;
+                align-items: flex-start;
+                padding: 0;
+                margin: -5px 0 5px 0;
+            ">
+            """, unsafe_allow_html=True)
+            st.image(logo_path, width=500, use_container_width=False, output_format='PNG')
+            st.markdown("</div>", unsafe_allow_html=True)
+    else:
+        # Fallback ohne Bild - kompakt ohne Hintergrund-Fläche
+        st.markdown("""
+        <div style="
+            padding: 5px 0; 
+            margin: 5px 0;
+        ">
+            <h2 style="
+                margin: 0; 
+                color: #6BB6FF; 
+                font-weight: 700;
+                font-size: 1.65rem;
+                line-height: 1.4;
+                text-shadow: 0 1px 2px rgba(107, 182, 255, 0.2);
+            ">
+                FutureFit Planning: Automatisierter Kompetenzabgleich für morgen
+            </h2>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    # Tutorial-Video als Pop-up
+    tutorial_video_path = os.path.join(BASE_DIR, "@TUTORIAL_Personalplanung_FutureFit.mp4 .mp4")
+    
+    # Prüfe ob Tutorial-Video existiert, sonst Fallback-Pfade
+    if not os.path.exists(tutorial_video_path):
+        possible_tutorial_paths = [
+            os.path.join(BASE_DIR, "@TUTORIAL_Personalplanung_FutureFit.mp4 .mp4"),
+            os.path.join(BASE_DIR, "TUTORIAL_Personalplanung_FutureFit.mp4"),
+            data_path("@TUTORIAL_Personalplanung_FutureFit.mp4 .mp4"),
+            data_path("TUTORIAL_Personalplanung_FutureFit.mp4"),
+        ]
+        for path in possible_tutorial_paths:
+            if os.path.exists(path):
+                tutorial_video_path = path
+                break
+    
+    # Werbevideo als Pop-up
+    werbe_video_path = os.path.join(BASE_DIR, "@WERBEVIDEO_Kompetenzabgleich.mp4 .mp4")
+    
+    # Prüfe ob Werbevideo existiert, sonst Fallback-Pfade
+    if not os.path.exists(werbe_video_path):
+        possible_werbe_paths = [
+            os.path.join(BASE_DIR, "@WERBEVIDEO_Kompetenzabgleich.mp4 .mp4"),
+            os.path.join(BASE_DIR, "WERBEVIDEO_Kompetenzabgleich.mp4"),
+            data_path("@WERBEVIDEO_Kompetenzabgleich.mp4 .mp4"),
+            data_path("WERBEVIDEO_Kompetenzabgleich.mp4"),
+        ]
+        for path in possible_werbe_paths:
+            if os.path.exists(path):
+                werbe_video_path = path
+                break
+    
+    # Buttons für Tutorial und Werbevideo (oben rechts neben Info)
+    if (tutorial_video_path and os.path.exists(tutorial_video_path)) or (werbe_video_path and os.path.exists(werbe_video_path)):
+        # Initialisiere Session State für Videos
+        if 'show_tutorial' not in st.session_state:
+            st.session_state.show_tutorial = False
+        if 'show_werbevideo' not in st.session_state:
+            st.session_state.show_werbevideo = False
+        
+        # Buttons zum Öffnen der Videos (nebeneinander in einer Zeile, gleiche Höhe)
+        # CSS für Einzeiler, gleiche Höhe und Hintergrundfarbe #6BB6FF
+        st.markdown("""
+        <style>
+        /* Selektoren für beide Buttons */
+        button[data-testid="baseButton-secondary"][key="werbe_button"],
+        button[data-testid="baseButton-secondary"][key="tutorial_button"],
+        button.stButton > button[key="werbe_button"],
+        button.stButton > button[key="tutorial_button"],
+        div[data-testid="column"]:nth-of-type(2) button,
+        div[data-testid="column"]:nth-of-type(3) button,
+        button:has-text("Jetzt Einführung ansehen"),
+        button:has-text("Tutorial") {
+            white-space: nowrap !important;
+            overflow: hidden !important;
+            text-overflow: ellipsis !important;
+            height: 38px !important;
+            min-height: 38px !important;
+            max-height: 38px !important;
+            padding: 0.25rem 0.75rem !important;
+            font-size: 0.85rem !important;
+            line-height: 1.2 !important;
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+        }
+        
+        /* Hintergrundfarbe #6BB6FF für beide Buttons - robuster Selektor */
+        div[data-testid="column"]:nth-of-type(2) .stButton > button,
+        div[data-testid="column"]:nth-of-type(3) .stButton > button,
+        div[data-testid="column"]:nth-of-type(2) button,
+        div[data-testid="column"]:nth-of-type(3) button {
+            background-color: #6BB6FF !important;
+            background: #6BB6FF !important;
+            color: white !important;
+            border: 1px solid #6BB6FF !important;
+            border-color: #6BB6FF !important;
+        }
+        
+        div[data-testid="column"]:nth-of-type(2) .stButton > button:hover,
+        div[data-testid="column"]:nth-of-type(3) .stButton > button:hover,
+        div[data-testid="column"]:nth-of-type(2) button:hover,
+        div[data-testid="column"]:nth-of-type(3) button:hover {
+            background-color: #5BA3F5 !important;
+            background: #5BA3F5 !important;
+            border-color: #5BA3F5 !important;
+        }
+        </style>
+        """, unsafe_allow_html=True)
+        
+        # Buttons mit direkter Farbe #6BB6FF - kombinierter Ansatz
+        col1, col2, col3 = st.columns([7, 2, 1])
+        with col2:
+            if werbe_video_path and os.path.exists(werbe_video_path):
+                if st.button("Jetzt Einführung ansehen", help="Klicken Sie hier, um das Werbevideo zu öffnen", use_container_width=True, key="werbe_button"):
+                    st.session_state.show_werbevideo = True
+                    st.session_state.show_tutorial = False
+                    st.rerun()
+        with col3:
+            if tutorial_video_path and os.path.exists(tutorial_video_path):
+                if st.button("Tutorial", help="Klicken Sie hier, um das Tutorial-Video zu öffnen", use_container_width=True, key="tutorial_button"):
+                    st.session_state.show_tutorial = True
+                    st.session_state.show_werbevideo = False
+                    st.rerun()
+        
+        # Aggressives JavaScript, um die Button-Farbe zu setzen - wird kontinuierlich ausgeführt
+        st.markdown("""
+        <style>
+        /* CSS für Buttons */
+        button[key="werbe_button"],
+        button[key="tutorial_button"] {
+            white-space: nowrap !important;
+            height: 38px !important;
+        }
+        </style>
+        <script>
+        (function() {
+            function applyBlueColor() {
+                const buttons = document.querySelectorAll('button');
+                buttons.forEach(function(btn) {
+                    const text = (btn.textContent || btn.innerText || '').trim();
+                    if (text === 'Jetzt Einführung ansehen' || text === 'Tutorial') {
+                        // Setze Farbe direkt im Style-Attribut
+                        btn.setAttribute('style', 'background-color: #6BB6FF !important; background: #6BB6FF !important; color: white !important; border: 1px solid #6BB6FF !important; white-space: nowrap !important; height: 38px !important;');
+                        // Setze auch direkt auf dem Element
+                        btn.style.backgroundColor = '#6BB6FF';
+                        btn.style.background = '#6BB6FF';
+                        btn.style.color = 'white';
+                        btn.style.borderColor = '#6BB6FF';
+                        btn.style.border = '1px solid #6BB6FF';
+                    }
+                });
+            }
+            
+            // Sofort ausführen
+            applyBlueColor();
+            
+            // Kontinuierlich ausführen (alle 50ms)
+            setInterval(applyBlueColor, 50);
+            
+            // MutationObserver
+            const observer = new MutationObserver(applyBlueColor);
+            observer.observe(document.body, {childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'class']});
+        })();
+        </script>
+        """, unsafe_allow_html=True)
+        
+        # Tutorial-Video als Pop-up in Expander (wenn aktiviert)
+        if st.session_state.show_tutorial and tutorial_video_path and os.path.exists(tutorial_video_path):
+            st.markdown("---")
+            with st.expander("🎬 **Tutorial: Personalplanung mit Kursempfehlung**", expanded=True):
+                st.video(tutorial_video_path)
+                st.markdown("**Hinweis:** Sie können das Video mit den Steuerelementen unten im Player steuern.")
+                if st.button("❌ Tutorial schließen", use_container_width=True):
+                    st.session_state.show_tutorial = False
+                    st.rerun()
+            st.markdown("---")
+        
+        # Werbevideo als Pop-up in Expander (wenn aktiviert)
+        if st.session_state.show_werbevideo and werbe_video_path and os.path.exists(werbe_video_path):
+            st.markdown("---")
+            with st.expander("🎥 **Einführung: Kompetenzabgleich**", expanded=True):
+                st.video(werbe_video_path)
+                st.markdown("**Hinweis:** Sie können das Video mit den Steuerelementen unten im Player steuern.")
+                if st.button("❌ Einführung schließen", use_container_width=True):
+                    st.session_state.show_werbevideo = False
+                    st.rerun()
+            st.markdown("---")
+    
     st.info("**Modellbasierte Personalplanung:** Diese Sektion liest IST- und SOLL-Mitarbeiter aus der XML-Datei ein und führt ein automatisches Matching basierend auf Skill-Übereinstimmungen durch. Für fehlende Fähigkeiten werden passende Kursempfehlungen angezeigt.")
     
-    # Lade XML-Datei
-    xml_path = data_path("Kompetenzabgleich_neuV1.xml")
+    # Datei-Upload-Bereich
+    st.markdown("### Archi XML-Datei auswählen")
     
-    if not os.path.exists(xml_path):
-        st.error(f"XML-Datei nicht gefunden: {xml_path}")
+    # Initialisiere Session State für XML-Pfad
+    if 'selected_xml_path' not in st.session_state:
+        st.session_state.selected_xml_path = None
+    
+    # Datei-Upload-Widget
+    uploaded_file = st.file_uploader(
+        "Archi XML-Datei auswählen",
+        type=['xml'],
+        help="Wählen Sie eine Archi XML-Datei aus, die IST- und SOLL-Mitarbeiter enthält. Sie können auch mehrere Dateien nacheinander auswählen und verarbeiten."
+    )
+    
+    # Verarbeite hochgeladene Datei
+    xml_path = None
+    if uploaded_file is not None:
+        # Lösche alte temporäre Datei, falls vorhanden
+        if st.session_state.selected_xml_path and os.path.exists(st.session_state.selected_xml_path):
+            try:
+                # Prüfe ob es eine temporäre Datei ist (nicht der Standard-Pfad)
+                if st.session_state.selected_xml_path != data_path("Kompetenzabgleich_neuV1.xml"):
+                    os.remove(st.session_state.selected_xml_path)
+            except Exception as e:
+                pass  # Ignoriere Fehler beim Löschen
+        
+        # Speichere die hochgeladene Datei temporär
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.xml', mode='wb') as tmp_file:
+            tmp_file.write(uploaded_file.getvalue())
+            tmp_path = tmp_file.name
+        
+        # Speichere den Pfad im Session State
+        st.session_state.selected_xml_path = tmp_path
+        xml_path = tmp_path
+        st.success(f"Datei erfolgreich geladen: {uploaded_file.name}")
+    elif st.session_state.selected_xml_path and os.path.exists(st.session_state.selected_xml_path):
+        # Verwende die zuvor ausgewählte Datei
+        xml_path = st.session_state.selected_xml_path
+        st.info(f"Verwende zuvor ausgewählte Datei: {os.path.basename(st.session_state.selected_xml_path)}")
+    else:
+        # Keine Datei ausgewählt - setze xml_path auf None
+        xml_path = None
+    
+    # Prüfe ob XML-Datei existiert
+    if not xml_path or not os.path.exists(xml_path):
+        if uploaded_file is not None:
+            # Datei wurde hochgeladen, aber konnte nicht gespeichert werden
+            st.error(f"Fehler beim Speichern der hochgeladenen Datei.")
+            return
+        # Keine Datei ausgewählt - zeige nur Info, keine Fehlermeldung
         return
     
-    # Parse XML-Datei
-    with st.spinner("Lade und parse XML-Datei..."):
-        xml_data = parse_ist_soll_xml(xml_path, cache_buster=FUTURE_PROFILE_CACHE_KEY)
+    # Speichere den aktuellen XML-Pfad im Session State für die Verarbeitung
+    st.session_state.current_xml_path = xml_path
     
-    if not xml_data['success']:
-        st.error(f"Fehler beim Parsen der XML-Datei: {xml_data.get('error', 'Unbekannter Fehler')}")
-        if 'traceback' in xml_data:
-            with st.expander("Fehlerdetails anzeigen"):
-                st.code(xml_data['traceback'])
+    # Button für Aktualisierung
+    st.markdown("---")
+    col1, col2 = st.columns([1, 4])
+    with col1:
+        update_button = st.button("Aktualisierung durchführen", type="primary", use_container_width=True)
+    
+    # Zeige Hinweis, wenn eine neue Datei hochgeladen wurde
+    if uploaded_file is not None:
+        st.success(f"Datei '{uploaded_file.name}' erfolgreich geladen. Klicken Sie auf 'Aktualisierung durchführen', um die Verarbeitung zu starten.")
+    
+    # Prüfe ob bereits verarbeitete Daten im Session State vorhanden sind
+    processing_data_key = 'xml_processing_data'
+    has_cached_data = processing_data_key in st.session_state and st.session_state[processing_data_key] is not None
+    
+    # Wenn bereits Daten vorhanden sind und Button nicht geklickt wurde, verwende die gecachten Daten
+    if has_cached_data and not update_button:
+        cached_data = st.session_state[processing_data_key]
+        xml_data = cached_data['xml_data']
+        ist_mitarbeiter = cached_data['ist_mitarbeiter']
+        soll_faehigkeiten = cached_data['soll_faehigkeiten']
+        total_soll_skills = cached_data['total_soll_skills']
+        xml_path = cached_data['xml_path']
+        # Verwende gecachte ist_mitarbeiter_mit_details falls vorhanden
+        if 'ist_mitarbeiter_mit_details' in st.session_state:
+            ist_mitarbeiter_mit_details = st.session_state['ist_mitarbeiter_mit_details']
+        else:
+            ist_mitarbeiter_mit_details = []
+        # Überspringe die XML-Verarbeitung und verwende die gecachten Daten
+        skip_processing = True
+    else:
+        skip_processing = False
+    
+    # Führe Verarbeitung nur aus, wenn Button geklickt wurde
+    if not update_button and not skip_processing:
+        if uploaded_file is None:
+            st.info("Bitte wählen Sie eine XML-Datei aus und klicken Sie dann auf 'Aktualisierung durchführen', um die SOLL-Profile & Rankings zu aktualisieren.")
         return
     
-    ist_mitarbeiter = xml_data['ist_mitarbeiter']
-    soll_faehigkeiten = xml_data['soll_faehigkeiten']
-    total_soll_skills = xml_data.get('soll_total_skill_count', len(soll_faehigkeiten))
+    # Normale Verarbeitung durchführen, wenn nicht übersprungen
+    if not skip_processing:
+        # Erstelle dynamischen Cache-Buster basierend auf Dateipfad und Zeitstempel
+        # Dies stellt sicher, dass bei einer neuen Datei der Cache invalidiert wird
+        cache_buster_value = f"{FUTURE_PROFILE_CACHE_KEY}_{xml_path}_{os.path.getmtime(xml_path) if os.path.exists(xml_path) else time.time()}"
+        
+        # Parse XML-Datei
+        with st.spinner("Lade und parse XML-Datei..."):
+            xml_data = parse_ist_soll_xml(xml_path, cache_buster=cache_buster_value)
+        
+        if not xml_data['success']:
+            st.error(f"Fehler beim Parsen der XML-Datei: {xml_data.get('error', 'Unbekannter Fehler')}")
+            if 'traceback' in xml_data:
+                with st.expander("Fehlerdetails anzeigen"):
+                    st.code(xml_data['traceback'])
+            return
+        
+        ist_mitarbeiter = xml_data['ist_mitarbeiter']
+        soll_faehigkeiten = xml_data['soll_faehigkeiten']
+        total_soll_skills = xml_data.get('soll_total_skill_count', len(soll_faehigkeiten))
+        
+        # Speichere alle wichtigen Daten im Session State für die Wiederherstellung
+        st.session_state.xml_processing_data = {
+            'xml_data': xml_data,
+            'ist_mitarbeiter': ist_mitarbeiter,
+            'soll_faehigkeiten': soll_faehigkeiten,
+            'total_soll_skills': total_soll_skills,
+            'xml_path': xml_path
+        }
     
-    # Zeige Debug-Informationen
-    if 'debug' in xml_data:
-        with st.expander("◈ Debug-Informationen", expanded=False):
-            debug = xml_data['debug']
-            st.write(f"**Gefundene Elemente:**")
-            st.write(f"- Gesamt Elemente: {debug.get('total_elements', 0)}")
-            st.write(f"- Alle Business Actors: {debug.get('alle_business_actors_count', 0)}")
-            st.write(f"- IST-Mitarbeiter (roh): {debug.get('ist_mitarbeiter_count', 0)}")
-            st.write(f"- Business Roles: {debug.get('business_roles_count', 0)}")
-            st.write(f"- Resources: {debug.get('resources_count', 0)}")
-            st.write(f"- Groupings: {debug.get('groupings_count', 0)}")
-            st.write(f"- Assignment-Beziehungen: {debug.get('assignments_count', 0)}")
-            st.write(f"- Association-Beziehungen: {debug.get('associations_count', 0)}")
-            st.write(f"- Composition-Beziehungen: {debug.get('compositions_count', 0)}")
-            st.write(f"- IST-Mitarbeiter mit Rollen: {debug.get('ist_mit_rollen_count', 0)}")
-            st.write(f"- SOLL-Fähigkeiten: {debug.get('soll_faehigkeiten_count', 0)}")
-            
-            # Zeige Details zu IST-Mitarbeitern
-            if ist_mitarbeiter:
-                st.write(f"\n**IST-Mitarbeiter Details:**")
-                for mitarbeiter in ist_mitarbeiter[:5]:  # Zeige nur die ersten 5
-                    rollen = ', '.join(mitarbeiter['business_roles']) if mitarbeiter['business_roles'] else 'Keine Rollen'
-                    st.write(f"- {mitarbeiter['name']}: {rollen}")
-                if len(ist_mitarbeiter) > 5:
-                    st.write(f"... und {len(ist_mitarbeiter) - 5} weitere")
-    
-    st.success(f"XML-Datei erfolgreich geladen!")
     st.info(f"""
     **XML-Daten:**
     - **IST-Mitarbeiter:** {len(ist_mitarbeiter)} Mitarbeiter mit Business Roles
@@ -6141,117 +6515,123 @@ def show_ist_soll_matching(employees_df, kldb_esco_df, occupation_skill_relation
     st.markdown("---")
     st.subheader("IST-Mitarbeiter (aus XML)")
     
-    # Bereite IST-Mitarbeiter-Daten mit Skills vor
-    ist_mitarbeiter_mit_details = []
-    nicht_gefundene_rollen = []  # Sammle Warnungen
+    # Bereite IST-Mitarbeiter-Daten mit Skills vor (nur wenn nicht übersprungen)
+    # Initialisiere nicht_gefundene_rollen immer, auch wenn übersprungen wird
+    nicht_gefundene_rollen = []
     
-    for mitarbeiter in ist_mitarbeiter:
-        mitarbeiter_name = mitarbeiter['name']
-        business_roles = mitarbeiter['business_roles']
+    if not skip_processing:
+        ist_mitarbeiter_mit_details = []
         
-        # Sammle alle Informationen für diesen Mitarbeiter
-        kldb_codes = []
-        esco_labels = []
-        esco_codes = []
-        role_matches = []
-        alle_skills_set = set()
-        
-        for role in business_roles:
-            # Verwende semantisches Matching für Business Role -> KldB-Code -> ESCO-Rolle
-            kldb_code, kldb_label, esco_label, esco_code = find_kldb_code_for_business_role_semantic(
-                role, kldb_esco_df, berufsbenennungen_df, min_similarity=0.2
-            )
+        for mitarbeiter in ist_mitarbeiter:
+            mitarbeiter_name = mitarbeiter['name']
+            business_roles = mitarbeiter['business_roles']
             
-            if kldb_code:
-                display_role_label = normalize_display_label(role)
-                kldb_codes.append(f"{kldb_code} ({display_role_label})")
-                esco_labels.append(esco_label)
-                esco_codes.append(esco_code)
-                role_matches.append({
-                    'business_role': role,
-                    'kldb_code': kldb_code,
-                    'kldb_label': display_role_label,
-                    'esco_label': esco_label,
-                    'esco_code': esco_code
-                })
-                
-                # Hole Skills für diese ESCO-Rolle
-                role_skills = get_skills_for_occupation_simple(
-                    esco_label,
-                    st.session_state.occupation_skills_mapping,
-                    occupations_df
+            # Sammle alle Informationen für diesen Mitarbeiter
+            kldb_codes = []
+            esco_labels = []
+            esco_codes = []
+            role_matches = []
+            alle_skills_set = set()
+            
+            for role in business_roles:
+                # Verwende semantisches Matching für Business Role -> KldB-Code -> ESCO-Rolle
+                kldb_code, kldb_label, esco_label, esco_code = find_kldb_code_for_business_role_semantic(
+                    role, kldb_esco_df, berufsbenennungen_df, min_similarity=0.2
                 )
                 
-                if role_skills:
-                    for skill in role_skills:
-                        skill_label = skill.get('skill_label', '')
-                        if skill_label:
-                            alle_skills_set.add(skill_label)
+                if kldb_code:
+                    display_role_label = normalize_display_label(role)
+                    kldb_codes.append(f"{kldb_code} ({display_role_label})")
+                    esco_labels.append(esco_label)
+                    esco_codes.append(esco_code)
+                    role_matches.append({
+                        'business_role': role,
+                        'kldb_code': kldb_code,
+                        'kldb_label': display_role_label,
+                        'esco_label': esco_label,
+                        'esco_code': esco_code
+                    })
+                    
+                    # Hole Skills für diese ESCO-Rolle
+                    role_skills = get_skills_for_occupation_simple(
+                        esco_label,
+                        st.session_state.occupation_skills_mapping,
+                        occupations_df
+                    )
+                    
+                    if role_skills:
+                        for skill in role_skills:
+                            skill_label = skill.get('skill_label', '')
+                            if skill_label:
+                                alle_skills_set.add(skill_label)
+                else:
+                    # Kein Match gefunden - sammle Warnung
+                    nicht_gefundene_rollen.append({
+                        'mitarbeiter': mitarbeiter_name,
+                        'role': role
+                    })
+            
+            # Prüfe auch manuelle Skills aus employees_df
+            employee_match = employees_df[employees_df['Name'].str.contains(mitarbeiter_name, case=False, na=False)]
+            if not employee_match.empty:
+                manual_skills = employee_match.iloc[0].get('Manual_Skills', '')
+                if manual_skills and pd.notna(manual_skills):
+                    for skill in str(manual_skills).split(';'):
+                        if skill.strip():
+                            alle_skills_set.add(skill.strip())
+            
+            ist_mitarbeiter_mit_details.append({
+                'name': mitarbeiter_name,
+                'business_roles': business_roles,
+                'kldb_codes': kldb_codes,
+                'esco_labels': esco_labels,
+                'esco_codes': esco_codes,
+                'skills': sorted(list(alle_skills_set)),
+                'role_matches': role_matches
+            })
+        
+        # Dedupliziere IST-Mitarbeiter nach Namen (falls noch Duplikate vorhanden)
+        ist_mitarbeiter_unique = {}
+        for mitarbeiter_detail in ist_mitarbeiter_mit_details:
+            name = mitarbeiter_detail['name']
+            if name not in ist_mitarbeiter_unique:
+                ist_mitarbeiter_unique[name] = mitarbeiter_detail
             else:
-                # Kein Match gefunden - sammle Warnung
-                nicht_gefundene_rollen.append({
-                    'mitarbeiter': mitarbeiter_name,
-                    'role': role
-                })
+                # Mitarbeiter existiert bereits - merge Business Roles und Skills
+                existing = ist_mitarbeiter_unique[name]
+                # Füge fehlende Business Roles hinzu
+                for role in mitarbeiter_detail['business_roles']:
+                    if role not in existing['business_roles']:
+                        existing['business_roles'].append(role)
+                # Füge fehlende KldB-Codes hinzu
+                for kldb in mitarbeiter_detail['kldb_codes']:
+                    if kldb not in existing['kldb_codes']:
+                        existing['kldb_codes'].append(kldb)
+                # Füge fehlende ESCO-Labels hinzu
+                for esco in mitarbeiter_detail['esco_labels']:
+                    if esco not in existing['esco_labels']:
+                        existing['esco_labels'].append(esco)
+                # Merge Skills (Set behält automatisch Eindeutigkeit)
+                existing_skills_set = set(existing['skills'])
+                new_skills_set = set(mitarbeiter_detail['skills'])
+                existing['skills'] = sorted(list(existing_skills_set | new_skills_set))
+                # Merge Matches
+                existing_matches = existing.get('role_matches', [])
+                for match in mitarbeiter_detail.get('role_matches', []):
+                    if not any(
+                        m['business_role'] == match['business_role'] and
+                        m['kldb_code'] == match['kldb_code'] and
+                        m.get('esco_code') == match.get('esco_code')
+                        for m in existing_matches
+                    ):
+                        existing_matches.append(match)
+                existing['role_matches'] = existing_matches
         
-        # Prüfe auch manuelle Skills aus employees_df
-        employee_match = employees_df[employees_df['Name'].str.contains(mitarbeiter_name, case=False, na=False)]
-        if not employee_match.empty:
-            manual_skills = employee_match.iloc[0].get('Manual_Skills', '')
-            if manual_skills and pd.notna(manual_skills):
-                for skill in str(manual_skills).split(';'):
-                    if skill.strip():
-                        alle_skills_set.add(skill.strip())
+        # Konvertiere zurück zu Liste
+        ist_mitarbeiter_mit_details = list(ist_mitarbeiter_unique.values())
         
-        ist_mitarbeiter_mit_details.append({
-            'name': mitarbeiter_name,
-            'business_roles': business_roles,
-            'kldb_codes': kldb_codes,
-            'esco_labels': esco_labels,
-            'esco_codes': esco_codes,
-            'skills': sorted(list(alle_skills_set)),
-            'role_matches': role_matches
-        })
-    
-    # Dedupliziere IST-Mitarbeiter nach Namen (falls noch Duplikate vorhanden)
-    ist_mitarbeiter_unique = {}
-    for mitarbeiter_detail in ist_mitarbeiter_mit_details:
-        name = mitarbeiter_detail['name']
-        if name not in ist_mitarbeiter_unique:
-            ist_mitarbeiter_unique[name] = mitarbeiter_detail
-        else:
-            # Mitarbeiter existiert bereits - merge Business Roles und Skills
-            existing = ist_mitarbeiter_unique[name]
-            # Füge fehlende Business Roles hinzu
-            for role in mitarbeiter_detail['business_roles']:
-                if role not in existing['business_roles']:
-                    existing['business_roles'].append(role)
-            # Füge fehlende KldB-Codes hinzu
-            for kldb in mitarbeiter_detail['kldb_codes']:
-                if kldb not in existing['kldb_codes']:
-                    existing['kldb_codes'].append(kldb)
-            # Füge fehlende ESCO-Labels hinzu
-            for esco in mitarbeiter_detail['esco_labels']:
-                if esco not in existing['esco_labels']:
-                    existing['esco_labels'].append(esco)
-            # Merge Skills (Set behält automatisch Eindeutigkeit)
-            existing_skills_set = set(existing['skills'])
-            new_skills_set = set(mitarbeiter_detail['skills'])
-            existing['skills'] = sorted(list(existing_skills_set | new_skills_set))
-            # Merge Matches
-            existing_matches = existing.get('role_matches', [])
-            for match in mitarbeiter_detail.get('role_matches', []):
-                if not any(
-                    m['business_role'] == match['business_role'] and
-                    m['kldb_code'] == match['kldb_code'] and
-                    m.get('esco_code') == match.get('esco_code')
-                    for m in existing_matches
-                ):
-                    existing_matches.append(match)
-            existing['role_matches'] = existing_matches
-    
-    # Konvertiere zurück zu Liste
-    ist_mitarbeiter_mit_details = list(ist_mitarbeiter_unique.values())
+        # Speichere im Session State
+        st.session_state.ist_mitarbeiter_mit_details = ist_mitarbeiter_mit_details
     
     # Synchronisiere automatisch gefundene KldB-Codes mit den Mitarbeiterdaten
     def sync_employee_roles_with_data(ist_details):
@@ -6329,9 +6709,6 @@ def show_ist_soll_matching(employees_df, kldb_esco_df, occupation_skill_relation
     ist_df = pd.DataFrame(ist_df_data)
     st.dataframe(ist_df, use_container_width=True, hide_index=True)
     
-    # Zeige Statistik
-    st.info(f"**Gefundene IST-Mitarbeiter:** {len(ist_mitarbeiter_mit_details)} (nach Deduplizierung)")
-    
     # Zeige Warnungen für nicht gefundene Rollen
     if nicht_gefundene_rollen:
         with st.expander("△ Warnung: Nicht zugeordnete Business Roles", expanded=False):
@@ -6369,97 +6746,123 @@ def show_ist_soll_matching(employees_df, kldb_esco_df, occupation_skill_relation
     st.session_state.ist_mitarbeiter_mit_details = ist_mitarbeiter_mit_details
     
     # Option zum Importieren der IST-Mitarbeiter in die zentrale Verwaltung
-    if st.checkbox("IST-Mitarbeiter in zentrale Mitarbeiter-Verwaltung importieren", key="import_ist_employees"):
-        if st.button("Importieren", key="import_button"):
-            with st.spinner("Importiere IST-Mitarbeiter..."):
-                imported_count = 0
-                updated_count = 0
-                
-                # Verwende die bereits berechneten Details mit KldB und ESCO
-                for mitarbeiter_detail in ist_mitarbeiter_mit_details:
-                    mitarbeiter_name = mitarbeiter_detail['name']
+    st.markdown("---")
+    st.subheader("Import in zentrale Mitarbeiter-Verwaltung")
+    
+    # Prüfe ob bereits importiert wurde
+    import_status_key = 'ist_employees_imported'
+    import_message_key = 'import_success_message'
+    
+    if import_status_key not in st.session_state:
+        st.session_state[import_status_key] = False
+    
+    if st.session_state[import_status_key]:
+        st.success("✅ IST-Mitarbeiter wurden bereits in die zentrale Mitarbeiter-Verwaltung importiert.")
+        if st.button("🔄 Erneut importieren", key="reimport_button"):
+            st.session_state[import_status_key] = False
+    else:
+        if st.button("IST-Mitarbeiter in zentrale Mitarbeiter-Verwaltung importieren", key="import_button", type="primary"):
+            # Verwende die Daten aus dem Session State
+            import_data = st.session_state.get('ist_mitarbeiter_mit_details', [])
+            
+            if not import_data:
+                st.error("Keine IST-Mitarbeiter-Daten verfügbar. Bitte führen Sie zuerst die Aktualisierung durch.")
+                st.info("Klicken Sie auf 'Aktualisierung durchführen', um die XML-Datei zu verarbeiten.")
+            else:
+                with st.spinner("Importiere IST-Mitarbeiter..."):
+                    # Lade employees_df aus Session State, falls vorhanden, sonst verwende Parameter
+                    current_employees_df = st.session_state.get('employees_data', employees_df.copy())
                     
-                    # Extrahiere KldB-Code und ESCO-Rolle aus den Details
-                    # Nimm die erste gefundene KldB/ESCO-Kombination (falls mehrere Rollen vorhanden)
-                    kldb_code = None
-                    esco_role = None
+                    imported_count = 0
+                    updated_count = 0
                     
-                    if mitarbeiter_detail['kldb_codes']:
-                        # Extrahiere KldB-Code aus dem ersten Eintrag (Format: "B 12345-101 (Label)" oder "B12345-101 (Label)")
-                        first_kldb_entry = mitarbeiter_detail['kldb_codes'][0]
-                        # Extrahiere den Code - verschiedene Formate möglich
-                        # Format 1: "B 12345-101 (Label)"
-                        # Format 2: "B12345-101 (Label)"
-                        # Format 3: "B12345-101" (ohne Label)
-                        kldb_match = re.search(r'([B]\s*\d+\s*-\s*\d+)', first_kldb_entry)
-                        if kldb_match:
-                            # Normalisiere Format: Entferne Leerzeichen, behalte Bindestrich
-                            kldb_code = kldb_match.group(1).replace(' ', '').strip()
-                        else:
-                            # Fallback: Versuche direkt nach dem Format zu suchen
-                            kldb_match = re.search(r'(B\d+-\d+)', first_kldb_entry)
+                    # Verwende die bereits berechneten Details mit KldB und ESCO
+                    for mitarbeiter_detail in import_data:
+                        mitarbeiter_name = mitarbeiter_detail['name']
+                        
+                        # Extrahiere KldB-Code und ESCO-Rolle aus den Details
+                        # Nimm die erste gefundene KldB/ESCO-Kombination (falls mehrere Rollen vorhanden)
+                        kldb_code = None
+                        esco_role = None
+                        
+                        if mitarbeiter_detail['kldb_codes']:
+                            # Extrahiere KldB-Code aus dem ersten Eintrag (Format: "B 12345-101 (Label)" oder "B12345-101 (Label)")
+                            first_kldb_entry = mitarbeiter_detail['kldb_codes'][0]
+                            # Extrahiere den Code - verschiedene Formate möglich
+                            # Format 1: "B 12345-101 (Label)"
+                            # Format 2: "B12345-101 (Label)"
+                            # Format 3: "B12345-101" (ohne Label)
+                            kldb_match = re.search(r'([B]\s*\d+\s*-\s*\d+)', first_kldb_entry)
                             if kldb_match:
-                                kldb_code = kldb_match.group(1)
+                                # Normalisiere Format: Entferne Leerzeichen, behalte Bindestrich
+                                kldb_code = kldb_match.group(1).replace(' ', '').strip()
+                            else:
+                                # Fallback: Versuche direkt nach dem Format zu suchen
+                                kldb_match = re.search(r'(B\d+-\d+)', first_kldb_entry)
+                                if kldb_match:
+                                    kldb_code = kldb_match.group(1)
+                        
+                        if mitarbeiter_detail['esco_labels']:
+                            # Nimm die erste ESCO-Rolle
+                            esco_role = mitarbeiter_detail['esco_labels'][0]
+                        
+                        # Falls keine KldB/ESCO gefunden, versuche es direkt aus den Business Roles zu extrahieren
+                        if not kldb_code or not esco_role:
+                            business_roles = mitarbeiter_detail.get('business_roles', [])
+                            if business_roles:
+                                # Verwende die erste Business Role für Matching
+                                role = business_roles[0]
+                                kldb_code_found, kldb_label_found, esco_label_found, esco_code_found = find_kldb_code_for_business_role_semantic(
+                                    role, kldb_esco_df, berufsbenennungen_df, min_similarity=0.2
+                                )
+                                if kldb_code_found and not kldb_code:
+                                    kldb_code = kldb_code_found
+                                if esco_label_found and not esco_role:
+                                    esco_role = esco_label_found
+                        
+                        # Prüfe ob Mitarbeiter bereits existiert
+                        existing = current_employees_df[current_employees_df['Name'].str.strip().str.lower() == mitarbeiter_name.strip().lower()]
+                        
+                        if existing.empty:
+                            # Neuer Mitarbeiter
+                            new_employee_id = f"EMP_{len(current_employees_df) + 1}"
+                            new_row = {
+                                'Employee_ID': new_employee_id,
+                                'Name': mitarbeiter_name,
+                                'KldB_5_digit': kldb_code if kldb_code else '',
+                                'Manual_Skills': '',
+                                'ESCO_Role': esco_role if esco_role else '',
+                                'Target_KldB_Code': '',
+                                'Target_KldB_Label': '',
+                                'Target_ESCO_Code': '',
+                                'Target_ESCO_Label': '',
+                                'Manual_Essential_Skills': '',
+                                'Manual_Optional_Skills': '',
+                                'Removed_Skills': ''
+                            }
+                            current_employees_df = pd.concat([current_employees_df, pd.DataFrame([new_row])], ignore_index=True)
+                            imported_count += 1
+                        else:
+                            # Aktualisiere bestehenden Mitarbeiter
+                            idx = existing.index[0]
+                            if kldb_code:
+                                current_employees_df.at[idx, 'KldB_5_digit'] = kldb_code
+                            if esco_role:
+                                current_employees_df.at[idx, 'ESCO_Role'] = esco_role
+                            updated_count += 1
                     
-                    if mitarbeiter_detail['esco_labels']:
-                        # Nimm die erste ESCO-Rolle
-                        esco_role = mitarbeiter_detail['esco_labels'][0]
+                    # Aktualisiere Session State
+                    st.session_state.employees_data = current_employees_df
                     
-                    # Falls keine KldB/ESCO gefunden, versuche es direkt aus den Business Roles zu extrahieren
-                    if not kldb_code or not esco_role:
-                        business_roles = mitarbeiter_detail.get('business_roles', [])
-                        if business_roles:
-                            # Verwende die erste Business Role für Matching
-                            role = business_roles[0]
-                            kldb_code_found, kldb_label_found, esco_label_found, esco_code_found = find_kldb_code_for_business_role_semantic(
-                                role, kldb_esco_df, berufsbenennungen_df, min_similarity=0.2
-                            )
-                            if kldb_code_found and not kldb_code:
-                                kldb_code = kldb_code_found
-                            if esco_label_found and not esco_role:
-                                esco_role = esco_label_found
-                    
-                    # Prüfe ob Mitarbeiter bereits existiert
-                    existing = employees_df[employees_df['Name'].str.strip().str.lower() == mitarbeiter_name.strip().lower()]
-                    
-                    if existing.empty:
-                        # Neuer Mitarbeiter
-                        new_employee_id = f"EMP_{len(employees_df) + 1}"
-                        new_row = {
-                            'Employee_ID': new_employee_id,
-                            'Name': mitarbeiter_name,
-                            'KldB_5_digit': kldb_code if kldb_code else '',
-                            'Manual_Skills': '',
-                            'ESCO_Role': esco_role if esco_role else '',
-                            'Target_KldB_Code': '',
-                            'Target_KldB_Label': '',
-                            'Target_ESCO_Code': '',
-                            'Target_ESCO_Label': '',
-                            'Manual_Essential_Skills': '',
-                            'Manual_Optional_Skills': '',
-                            'Removed_Skills': ''
-                        }
-                        employees_df = pd.concat([employees_df, pd.DataFrame([new_row])], ignore_index=True)
-                        imported_count += 1
+                    # Speichere in CSV
+                    if save_employees_to_csv(current_employees_df):
+                        st.session_state[import_status_key] = True
+                        # Zeige Erfolgsmeldung direkt an (ohne rerun)
+                        st.success(f"✅ Import abgeschlossen: {imported_count} neue Mitarbeiter importiert, {updated_count} Mitarbeiter aktualisiert.")
+                        st.info("ℹ Die Mitarbeiter sind jetzt in der zentralen Mitarbeiter-Verwaltung verfügbar und können in allen Funktionen (Mitarbeiter-Kompetenzprofile, Berufsabgleich, Strategische Weiterbildung, Kursempfehlungen) verwendet werden.")
                     else:
-                        # Aktualisiere bestehenden Mitarbeiter
-                        idx = existing.index[0]
-                        if kldb_code:
-                            employees_df.at[idx, 'KldB_5_digit'] = kldb_code
-                        if esco_role:
-                            employees_df.at[idx, 'ESCO_Role'] = esco_role
-                        updated_count += 1
-                
-                # Aktualisiere Session State
-                st.session_state.employees_data = employees_df
-                
-                # Speichere in CSV
-                if save_employees_to_csv(employees_df):
-                    st.success(f"✓ Import abgeschlossen: {imported_count} neue Mitarbeiter importiert, {updated_count} Mitarbeiter aktualisiert.")
-                    st.info("ℹ Die Mitarbeiter sind jetzt in der zentralen Mitarbeiter-Verwaltung verfügbar und können in allen Funktionen (Mitarbeiter-Kompetenzprofile, Berufsabgleich, Strategische Weiterbildung, Kursempfehlungen) verwendet werden.")
-                else:
-                    st.warning("△ Import durchgeführt, aber Speichern in CSV fehlgeschlagen!")
-                    st.info("ℹ Die Mitarbeiter sind im Session State verfügbar, aber nicht dauerhaft gespeichert.")
+                        st.warning("△ Import durchgeführt, aber Speichern in CSV fehlgeschlagen!")
+                        st.info("ℹ Die Mitarbeiter sind im Session State verfügbar, aber nicht dauerhaft gespeichert.")
     
     # Hinweis: Das Matching wird im folgenden Abschnitt pro SOLL-Profil automatisch berechnet.
     
